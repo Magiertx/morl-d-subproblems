@@ -57,6 +57,7 @@ def main():
         env=env,
         num_subproblems=args.num_subproblems,
         init_w_sampling=args.init_w_sampling,
+        archive_size=None,
         actor_lr=config['actor_lr'],
         critic_lr=config['critic_lr'],
         gamma=config['gamma'],
