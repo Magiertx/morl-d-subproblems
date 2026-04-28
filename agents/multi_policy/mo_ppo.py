@@ -224,7 +224,7 @@ class MOPPO(Agent):
                 net_arch=net_arch,
                 reward_dim=self.reward_dim,
                 layernorm=self.layernorm
-            ).to(self.device).double()
+            ).to(self.device)
 
             agent = PPO(
                 actor_critic=policy,
@@ -439,10 +439,31 @@ class MOPPO(Agent):
             json.dump(config, f, indent=4)
         print(f'[INFO] MO-PPO configuration saved')
 
+    def _compute_signals(self, active_tasks: list) -> dict:
+        """
+        Compute performance signals used by budget allocation heuristics.
+        
+        Args:
+            active_tasks (list): List of currently active task dictionaries.
+            
+        Returns:
+            dict: Dictionary containing historical and current performance metrics.
+        """
+        scalars = [t['scalar_history'][-1] if t['scalar_history'] else -200 for t in active_tasks]
+        gaps = [max(scalars + [-200]) - s for s in scalars]
+        return {
+            'scalar_rewards': scalars,
+            'performance_gaps': gaps,
+            'improvement_rates': [(t['scalar_history'][-1] - t['scalar_history'][-2]) if len(t['scalar_history']) >= 2 else 0.0 for t in active_tasks],
+            'stagnation_counts': [t['stagnation_count'] for t in active_tasks],
+            'scalar_histories': [list(t['scalar_history']) for t in active_tasks]
+        }
+
     def train(
             self,
             total_timesteps: int,
             ref_point: np.ndarray,
+            heuristic=None,
             eval_timesteps: int = 10_000,
             known_pareto_front: Optional[list[np.ndarray]] = None,
             num_eval_weights: int = 100,
@@ -469,6 +490,10 @@ class MOPPO(Agent):
             ref_point (np.ndarray):
                 Reference point for Hypervolume computation. Should be dominated
                 by all Pareto-optimal solutions in the archive.
+            heuristic (Optional[DynamicHeuristic]):
+                An instantiated heuristic object used for dynamic budget allocation 
+                (e.g., RoundRobinHeuristic, EliminationHeuristic). If None, defaults 
+                to a standard static round-robin approach.
             eval_timesteps (int):
                 Number of aggregated environment steps between consecutive
                 evaluations and archive updates. Controls archiving frequency
@@ -530,7 +555,15 @@ class MOPPO(Agent):
             print(f'Hypervolume @ step 0: {round(hv, 2)}')
         next_eval_timestep = eval_timesteps
 
-        selected_samples = self.initial_samples
+        # Track active tasks with a dictionary similar to mo_sac.py
+        active_tasks = [{'id': idx, 'scalar_history': [], 'stagnation_count': 0, 'active': True} for idx in range(len(self.initial_samples))]
+        
+        # Initial quick evaluation to seed history
+        for t in active_tasks:
+            # Seed history with a low initial value to allow first comparison
+            t['scalar_history'].append(-1000.0)
+
+        all_samples = self.initial_samples.copy()
 
         while current_timestep < total_timesteps:
             # Compute how many iterations until next eval (or end)
@@ -546,11 +579,37 @@ class MOPPO(Agent):
 
             end_iteration = current_iteration + this_update
 
+            if heuristic is not None and heuristic.__class__.__name__ != 'RoundRobinHeuristic':
+                active_list = [t for t in active_tasks if t['active']]
+                if not active_list: break
+
+                signals = self._compute_signals(active_tasks)
+                for i, t in enumerate(active_list):
+                    if heuristic.should_deactivate(t, i, signals):
+                        t['active'] = False
+                        print(f"--- Task {t['id']} ELIMINATED at {current_timestep} steps ---")
+
+                active_list = [t for t in active_tasks if t['active']]
+                if not active_list: break
+
+                signals = self._compute_signals(active_tasks)
+                chosen_idx = heuristic.select_next_task(active_list, signals)
+                chosen_real_idx = active_list[chosen_idx]['id']
+                
+                print(f"Allocating {this_update * timesteps_per_iteration} steps to Task {chosen_real_idx}")
+                selected_ids = [chosen_real_idx]
+                selected_samples = [all_samples[chosen_real_idx]]
+            else:
+                selected_ids = [i for i, t in enumerate(active_tasks) if t['active']]
+                selected_samples = [all_samples[i] for i in selected_ids]
+
+            if not selected_samples: break
+
             # Launch PPO workers
             processes = []
             results_queue = Queue()
             done_event = Event()
-            for sample_id, sample in enumerate(selected_samples):
+            for sample_id, sample in zip(selected_ids, selected_samples):
                 p = Process(target=ppo_worker,
                             args=(sample_id, sample, self.device, current_iteration, end_iteration, total_iterations,
                                   self.env_id, self.seed, self.num_processes, self.num_steps, self.gamma,
@@ -565,7 +624,21 @@ class MOPPO(Agent):
             all_sample_batch = []
             for _ in processes:
                 rl_results = results_queue.get()
-                all_sample_batch += [Sample.copy_from(s) for s in rl_results['offspring_batch']]
+                returned_samples = [Sample.copy_from(s) for s in rl_results['offspring_batch']]
+                all_sample_batch += returned_samples
+                
+                # Update the specific sample in our all_samples list
+                real_id = rl_results['task_id']
+                all_samples[real_id] = returned_samples[-1]
+                
+                # Compute scalar return from the worker's evaluation and update history
+                latest_sample = returned_samples[-1]
+                scalar_val = np.dot(latest_sample.objs, latest_sample.weights)
+                
+                task = active_tasks[real_id]
+                prev_s = task['scalar_history'][-1]
+                task['stagnation_count'] = 0 if scalar_val > prev_s + 0.5 else task['stagnation_count'] + 1
+                task['scalar_history'].append(scalar_val)
 
             # Signal completion
             done_event.set()
@@ -575,8 +648,6 @@ class MOPPO(Agent):
             # Update archive
             for sample in all_sample_batch:
                 self.ep.update([sample])
-
-            selected_samples = all_sample_batch
 
             # Update counters
             current_iteration += this_update

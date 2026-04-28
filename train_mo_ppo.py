@@ -1,4 +1,8 @@
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from heuristics.dynamic_heuristics import RoundRobinHeuristic, RankBasedHeuristic, BanditHeuristic, EliminationHeuristic
+
 import torch
 import argparse
 import numpy as np
@@ -9,6 +13,7 @@ from misc.utils import read_env_config, read_algo_config
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
 def main():
@@ -28,8 +33,20 @@ def main():
                         help='Number of MO-SAC subproblems / weight vectors (policies) to optimize in parallel.')
     parser.add_argument('--init_w_sampling', type=str, default='uniform', 
                         help='Initial weight sampling strategy.')
+    parser.add_argument('--heuristic', type=str, default='round-robin',
+                        choices=['round-robin', 'rank-based', 'bandit', 'elimination'],
+                        help='Budget allocation heuristic to use during training.')
 
     args = parser.parse_args()
+
+    heuristic_map = {
+        'round-robin': (RoundRobinHeuristic, {}),
+        'rank-based': (RankBasedHeuristic, {}),
+        'bandit': (BanditHeuristic, {'exploration_constant': 1.0}),
+        'elimination': (EliminationHeuristic, {'window_size': 5}),
+    }
+    h_cls, h_kwargs = heuristic_map[args.heuristic]
+    heuristic_obj = h_cls(**h_kwargs)
 
     env_config = read_env_config(f'configs/environment_configs.json')
     env_id = env_config[args.env]['env_id']
@@ -82,6 +99,7 @@ def main():
         total_timesteps=args.total_timesteps,
         eval_timesteps=10_000,
         ref_point=ref_point,
+        heuristic=heuristic_obj,
         known_pareto_front=None,
         num_eval_weights=100,
         eval_rep=5,

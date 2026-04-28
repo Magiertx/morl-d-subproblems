@@ -346,12 +346,83 @@ class MOSAC(Agent):
                     else:
                         ag.update(batch)
 
+    def _train_single_agent(self, agent_idx: int, timesteps: int):
+        """
+        Train a single specific agent for a given number of timesteps.
+        
+        Args:
+            agent_idx (int): Index of the agent to train.
+            timesteps (int): Number of environment steps to collect and train on.
+        """
+        remaining = timesteps
+        agent = self.agents[agent_idx]
+        while remaining > 0:
+            agent.collect_sample(self.replay_buffer)
+            self.global_step += 1
+            remaining -= 1
+
+            if self.replay_buffer.size < self.batch_size:
+                continue
+
+            for _ in range(self.gradient_updates):
+                batch = self.replay_buffer.sample(self.batch_size, to_tensor=True, device=self.device)
+                if self.update_felten:
+                    agent.update_felten(batch)
+                else:
+                    agent.update(batch)
+
+    def _evaluate_agent(self, agent, env: gym.Env, weight: np.ndarray) -> float:
+        """
+        Evaluate a single agent's performance using its current policy.
+        
+        Args:
+            agent (Agent): The agent instance to evaluate.
+            env (gym.Env): The evaluation environment.
+            weight (np.ndarray): The preference weight vector assigned to the agent.
+            
+        Returns:
+            float: The scalarized performance score.
+        """
+        import torch
+        all_rewards = []
+        for _ in range(3):
+            obs, _ = env.reset(); term = trunc = False; ep_r = np.zeros(self.reward_dim)
+            while not (term or trunc):
+                with torch.no_grad():
+                    action = agent.eval(obs, weight)
+                obs, r, term, trunc, _ = env.step(action)
+                ep_r += r
+            all_rewards.append(ep_r)
+        w_np = weight.cpu().numpy() if hasattr(weight, 'cpu') else weight
+        return float(np.dot(np.mean(all_rewards, axis=0), w_np))
+
+    def _compute_signals(self, active_tasks: list) -> dict:
+        """
+        Compute performance signals used by budget allocation heuristics.
+        
+        Args:
+            active_tasks (list): List of currently active task dictionaries.
+            
+        Returns:
+            dict: Dictionary containing historical and current performance metrics.
+        """
+        scalars = [t['scalar_history'][-1] if t['scalar_history'] else -200 for t in active_tasks]
+        gaps = [max(scalars + [-200]) - s for s in scalars]
+        return {
+            'scalar_rewards': scalars,
+            'performance_gaps': gaps,
+            'improvement_rates': [(t['scalar_history'][-1] - t['scalar_history'][-2]) if len(t['scalar_history']) >= 2 else 0.0 for t in active_tasks],
+            'stagnation_counts': [t['stagnation_count'] for t in active_tasks],
+            'scalar_histories': [list(t['scalar_history']) for t in active_tasks]
+        }
+
     def train(
             self,
             total_timesteps: int,
             eval_timesteps: int,
             eval_env: gym.Env,
             ref_point: np.ndarray,
+            heuristic=None,
             known_pareto_front: Optional[list[np.ndarray]] = None,
             num_eval_weights: int = 100,
             eval_rep: int = 5,
@@ -382,6 +453,12 @@ class MOSAC(Agent):
             ref_point (np.ndarray):
                 Reference point for Hypervolume computation. Should be
                 dominated by all Pareto-optimal solutions.
+            heuristic:
+                Optional budget allocation heuristic instance that implements
+                methods for deciding which agent to train at each interval and
+                when to deactivate underperforming agents. If None, a simple
+                round-robin allocation strategy is used where all agents are trained
+                for equal amounts of time without deactivation.
             known_pareto_front (Optional[list[np.ndarray]]):
                 Ground-truth Pareto front for logging additional metrics such
                 as IGD, if available. If None, only archive-based metrics
@@ -437,9 +514,41 @@ class MOSAC(Agent):
             log_verbose=log_verbose
         )
 
+        active_tasks = [{'id': idx, 'agent': agent, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'weight': agent.weights} for idx, agent in enumerate(self.agents)]
+        
+        for t in active_tasks:
+            s = self._evaluate_agent(t['agent'], eval_env, t['weight'])
+            t['scalar_history'].append(s)
+
         while self.global_step < total_timesteps:
             steps_this_interval = min(eval_timesteps, total_timesteps - self.global_step)
-            self._train_all_agents(timesteps=steps_this_interval)
+
+            if heuristic is not None and heuristic.__class__.__name__ != 'RoundRobinHeuristic':
+                active_list = [t for t in active_tasks if t['active']]
+                if not active_list: break
+
+                signals = self._compute_signals(active_tasks)
+                for i, t in enumerate(active_list):
+                    if heuristic.should_deactivate(t, i, signals):
+                        t['active'] = False
+                        print(f"--- Task {t['id']} ELIMINATED at {self.global_step} steps ---")
+
+                active_list = [t for t in active_tasks if t['active']]
+                if not active_list: break
+
+                signals = self._compute_signals(active_tasks)
+                chosen_idx = heuristic.select_next_task(active_list, signals)
+                chosen = active_list[chosen_idx]
+                
+                print(f"Allocating {steps_this_interval} steps to Task {chosen['id']}")
+                self._train_single_agent(chosen['id'], steps_this_interval)
+                
+                s = self._evaluate_agent(chosen['agent'], eval_env, chosen['weight'])
+                prev_s = chosen['scalar_history'][-1]
+                chosen['stagnation_count'] = 0 if s > prev_s + 0.5 else chosen['stagnation_count'] + 1
+                chosen['scalar_history'].append(s)
+            else:
+                self._train_all_agents(timesteps=steps_this_interval)
 
             self._eval_all_agents(
                 self.agents,

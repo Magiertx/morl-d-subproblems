@@ -82,6 +82,7 @@ def ppo_worker(sample_id: int,
                eval_gamma: float,
                results_queue: any,
                done_event: any):
+    torch.set_default_dtype(torch.float64)
     env_params, actor_critic, agent, weights = sample.env_params, sample.actor_critic, sample.agent, sample.weights
 
 
