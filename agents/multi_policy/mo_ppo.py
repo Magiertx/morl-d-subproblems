@@ -532,13 +532,13 @@ class MOPPO(Agent):
         writer = SummaryWriter(log_dir=runs_path, filename_suffix=f'{self.seed:04d}')
 
         # Compute iteration interval from timestep interval
-        timesteps_per_iteration = self.num_subproblems * self.num_steps
-
-        total_iterations = total_timesteps // timesteps_per_iteration
+        # A single iteration of a single PPO worker consumes num_processes * num_steps steps
+        steps_per_task_iteration = self.num_processes * self.num_steps
 
         # Track actual timesteps for evaluation
         current_iteration = 0
         current_timestep = 0
+        total_iterations = total_timesteps // steps_per_task_iteration
 
         # Initial evaluation at step 0
         if self.log:
@@ -566,12 +566,21 @@ class MOPPO(Agent):
         all_samples = self.initial_samples.copy()
 
         while current_timestep < total_timesteps:
+            # For heuristics that run 1 task, the cost per iteration is steps_per_task_iteration.
+            # For round-robin (all tasks), the cost per iteration is len(active_tasks) * steps_per_task_iteration.
+            
+            if heuristic is not None and heuristic.__class__.__name__ != 'RoundRobinHeuristic':
+                timesteps_per_iteration = steps_per_task_iteration
+            else:
+                num_active = sum([1 for t in active_tasks if t['active']])
+                timesteps_per_iteration = num_active * steps_per_task_iteration if num_active > 0 else steps_per_task_iteration
+
             # Compute how many iterations until next eval (or end)
             timesteps_to_next_eval = next_eval_timestep - current_timestep
             iters_to_next_eval = max(1, timesteps_to_next_eval // timesteps_per_iteration)
 
             # Don't exceed total timesteps
-            max_iters_remaining = (total_timesteps - current_timestep) // timesteps_per_iteration
+            max_iters_remaining = max(1, (total_timesteps - current_timestep) // timesteps_per_iteration)
             this_update = min(iters_to_next_eval, max_iters_remaining)
 
             if this_update < 1:
@@ -596,12 +605,15 @@ class MOPPO(Agent):
                 chosen_idx = heuristic.select_next_task(active_list, signals)
                 chosen_real_idx = active_list[chosen_idx]['id']
                 
-                print(f"Allocating {this_update * timesteps_per_iteration} steps to Task {chosen_real_idx}")
+                allocated_steps = this_update * steps_per_task_iteration
+                print(f"Allocating {allocated_steps} steps to Task {chosen_real_idx}")
                 selected_ids = [chosen_real_idx]
                 selected_samples = [all_samples[chosen_real_idx]]
             else:
                 selected_ids = [i for i, t in enumerate(active_tasks) if t['active']]
                 selected_samples = [all_samples[i] for i in selected_ids]
+                allocated_steps = this_update * timesteps_per_iteration
+                print(f"Allocating {allocated_steps} steps across all active tasks")
 
             if not selected_samples: break
 
@@ -651,7 +663,7 @@ class MOPPO(Agent):
 
             # Update counters
             current_iteration += this_update
-            current_timestep = current_iteration * timesteps_per_iteration
+            current_timestep += allocated_steps
 
             # Evaluate if we've crossed the threshold
             if current_timestep >= next_eval_timestep and self.log:

@@ -48,14 +48,15 @@ def main():
     h_cls, h_kwargs = heuristic_map[args.heuristic]
     heuristic_obj = h_cls(**h_kwargs)
 
-    env_config = read_env_config(f'configs/environment_configs.json')
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    env_config = read_env_config(os.path.join(base_dir, 'configs', 'environment_configs.json'))
     env_id = env_config[args.env]['env_id']
     ref_point = env_config[args.env]['ref_point']
 
     env = mo_gym.make(env_id, max_episode_steps=args.max_episode_steps)
     ref_point = np.array(ref_point)
 
-    config = read_algo_config(f'configs/multi_policy/mo_ppo.json')
+    config = read_algo_config(os.path.join(base_dir, 'configs', 'multi_policy', 'mo_ppo.json'))
 
     agent = MOPPO(
         env_id=env_id,
