@@ -160,6 +160,10 @@ class MOSAC(Agent):
             agent = self._create_new_agent(initial_weights[i])
             self.agents.append(agent)
 
+        # Persistent round-robin cursor for _train_all_agents so the rotation
+        # continues across evaluation intervals instead of restarting at 0.
+        self._agent_rr_idx = 0
+
     def _create_new_agent(self, w: np.ndarray):
         env = mo_gym.make(self.env_id, max_episode_steps=self.max_episode_steps)
         env.observation_space.seed(self.env_seed)
@@ -328,12 +332,15 @@ class MOSAC(Agent):
     def _train_all_agents(self,
                           timesteps: int):
         remaining = timesteps
+        n_agents = len(self.agents)
         while remaining > 0:
-            step_count = min(len(self.agents), remaining)
-            for idx, agent in enumerate(list(self.agents)[:step_count]):
-                agent.collect_sample(self.replay_buffer)
+            step_count = min(n_agents, remaining)
+            for offset in range(step_count):
+                agent_idx = (self._agent_rr_idx + offset) % n_agents
+                self.agents[agent_idx].collect_sample(self.replay_buffer)
                 self.global_step += 1
                 remaining -= 1
+            self._agent_rr_idx = (self._agent_rr_idx + step_count) % n_agents
 
             if self.replay_buffer.size < self.batch_size:
                 continue
