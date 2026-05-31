@@ -1,7 +1,13 @@
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from heuristics.dynamic_heuristics import RoundRobinHeuristic, RankBasedHeuristic, BanditHeuristic, EliminationHeuristic
+from heuristics.dynamic_heuristics import (
+    RoundRobinHeuristic,
+    RankBasedHeuristic,
+    BanditHeuristic,
+    EliminationHeuristic,
+    StagnationBasedHeuristic,
+)
 
 import torch
 import argparse
@@ -34,7 +40,7 @@ def main():
     parser.add_argument('--init_w_sampling', type=str, default='uniform', 
                         help='Initial weight sampling strategy.')
     parser.add_argument('--heuristic', type=str, default='round-robin',
-                        choices=['round-robin', 'rank-based', 'bandit', 'elimination'],
+                        choices=['round-robin', 'rank-based', 'bandit', 'elimination', 'stagnation-based'],
                         help='Budget allocation heuristic to use during training.')
 
     args = parser.parse_args()
@@ -44,6 +50,7 @@ def main():
         'rank-based': (RankBasedHeuristic, {}),
         'bandit': (BanditHeuristic, {'exploration_constant': 1.0}),
         'elimination': (EliminationHeuristic, {'window_size': 5}),
+        'stagnation-based': (StagnationBasedHeuristic, {}),
     }
     h_cls, h_kwargs = heuristic_map[args.heuristic]
     heuristic_obj = h_cls(**h_kwargs)
