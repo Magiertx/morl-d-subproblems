@@ -76,7 +76,6 @@ def main():
         actor_clip_norm=config['actor_clip_norm'],
         critic_clip_norm=config['critic_clip_norm'],
         max_episode_steps=args.max_episode_steps,
-        update_felten=False,
         log=True,
         seed=args.seed,
         device='auto',

@@ -222,65 +222,6 @@ class SACContinues:
             polyak_update(self.qf1.parameters(), self.qf1_target.parameters(), self.tau)
             polyak_update(self.qf2.parameters(), self.qf2_target.parameters(), self.tau)
 
-    def update_felten(self, batch: tuple):
-        # https://github.com/LucasAlegre/morl-baselines/blob/main/morl_baselines/single_policy/ser/mosac_continuous_action.py
-        # Only correct under a linear function!
-        if self.global_step < self.learning_starts:
-            return
-
-        s_obs, s_actions, s_rewards, s_next_obs, s_dones = batch
-        not_done = (1.0 - s_dones.float()).view(-1)
-
-        with torch.no_grad():
-            next_a, next_logp, _ = self.actor.sample(s_next_obs)
-
-            q1_pi_vec = self.qf1_target(s_next_obs, next_a)
-            q2_pi_vec = self.qf2_target(s_next_obs, next_a)
-            q1_next_target = (self.weights * q1_pi_vec).sum(dim=-1)
-            q2_next_target = (self.weights * q2_pi_vec).sum(dim=-1)
-            min_qf_next_target = torch.min(q1_next_target, q2_next_target) - (self.alpha * next_logp).flatten()
-            scalarized_rewards = (self.weights * s_rewards).sum(dim=-1)
-
-            next_q_value = scalarized_rewards.flatten() + not_done * self.gamma * min_qf_next_target
-
-        q1_cur_vec = self.qf1(s_obs, s_actions)
-        q2_cur_vec = self.qf2(s_obs, s_actions)
-        q1_a_values = (self.weights * q1_cur_vec).sum(dim=-1)
-        q2_a_values = (self.weights * q2_cur_vec).sum(dim=-1)
-
-        qf_loss = F.mse_loss(q1_a_values, next_q_value) + F.mse_loss(q2_a_values, next_q_value)
-
-        self.q_optimizer.zero_grad(set_to_none=True)
-        qf_loss.backward()
-        if self.clip_grad_norm:
-            torch.nn.utils.clip_grad_norm_(
-                list(self.qf1.parameters()) + list(self.qf2.parameters()),
-                self.critic_clip_norm
-            )
-        self.q_optimizer.step()
-
-        if self.global_step % self.policy_freq == 0:
-            pi, log_pi, _ = self.actor.sample(s_obs)
-
-            q1_pi_vec = self.qf1(s_obs, pi)
-            q2_pi_vec = self.qf2(s_obs, pi)
-
-            q1_pi_s = (self.weights * q1_pi_vec).sum(dim=-1)
-            q2_pi_s = (self.weights * q2_pi_vec).sum(dim=-1)
-            q_min_pi_s = torch.minimum(q1_pi_s, q2_pi_s)
-
-            actor_loss = (self.alpha * log_pi.squeeze(-1) - q_min_pi_s).mean()
-
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            if self.clip_grad_norm:
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_clip_norm)
-            self.actor_optimizer.step()
-
-        if self.global_step % self.target_net_freq == 0:
-            polyak_update(self.qf1.parameters(), self.qf1_target.parameters(), self.tau)
-            polyak_update(self.qf2.parameters(), self.qf2_target.parameters(), self.tau)
-
     def collect_sample(self, replay_buffer):
         if self.global_step < self.learning_starts:
             action = self.env.action_space.sample()

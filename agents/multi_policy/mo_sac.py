@@ -43,7 +43,6 @@ class MOSAC(Agent):
                  actor_clip_norm: float = 2.0,
                  critic_clip_norm: float = 5.0,
                  max_episode_steps: int = 500,
-                 update_felten: bool = False,  # Critic update after https://jair.org/index.php/jair/article/view/15702
                  log: bool = True,
                  seed: int = 42,
                  device: str = 'auto',
@@ -106,11 +105,6 @@ class MOSAC(Agent):
                 Maximum gradient norm for critic network updates.
             max_episode_steps (int):
                 Maximum number of steps per episode before truncation.
-            update_felten (bool):
-                If True, uses the scalar critic update rule from Felten et al.
-                (https://jair.org/index.php/jair/article/view/15702) that applies
-                scalarization within the Bellman backup. If False, uses the
-                vector-valued critic update that preserves per-objective TD errors.
             log (bool):
                 Whether to log training metrics to TensorBoard.
             seed (int):
@@ -143,7 +137,6 @@ class MOSAC(Agent):
         self.actor_clip_norm = actor_clip_norm
         self.critic_clip_norm = critic_clip_norm
         self.max_episode_steps = max_episode_steps
-        self.update_felten = update_felten
         self.log = log
 
         # Pareto archive to store evaluated policies
@@ -288,7 +281,6 @@ class MOSAC(Agent):
             'actor_clip_norm': self.actor_clip_norm,
             'critic_clip_norm': self.critic_clip_norm,
             'max_episode_steps': self.max_episode_steps,
-            'update_felten': self.update_felten,
             'seed': self.seed,
         }
         with open(os.path.join(path, f'{file_name}.json'), 'w') as f:
@@ -348,10 +340,7 @@ class MOSAC(Agent):
             for _ in range(self.gradient_updates):
                 batch = self.replay_buffer.sample(self.batch_size, to_tensor=True, device=self.device)
                 for ag in self.agents:
-                    if self.update_felten:
-                        ag.update_felten(batch)
-                    else:
-                        ag.update(batch)
+                    ag.update(batch)
 
     def _train_single_agent(self, agent_idx: int, timesteps: int):
         """
@@ -373,10 +362,7 @@ class MOSAC(Agent):
 
             for _ in range(self.gradient_updates):
                 batch = self.replay_buffer.sample(self.batch_size, to_tensor=True, device=self.device)
-                if self.update_felten:
-                    agent.update_felten(batch)
-                else:
-                    agent.update(batch)
+                agent.update(batch)
 
     def _evaluate_agent(self, agent, env: gym.Env, weight: np.ndarray) -> float:
         """
