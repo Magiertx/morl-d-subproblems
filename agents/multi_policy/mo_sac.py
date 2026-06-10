@@ -301,6 +301,9 @@ class MOSAC(Agent):
                          known_pareto_front: Optional[list[np.ndarray]] = None,
                          log_verbose: int = 0,
                          ):
+        import os
+        h_name = getattr(self, 'heuristic_name', 'RoundRobin')
+        history_rows = []
         for agent in agents:
             scalarized_return, scalarized_discounted_return, vec_return, disc_vec_return = (
                 evaluate_single_weight(agent, env=eval_env, w=agent.weights.cpu().numpy(), rep=eval_rep,
@@ -313,6 +316,36 @@ class MOSAC(Agent):
                     writer.add_scalar(f'return/vec_return_{j}/agent_{agent.id}', r_val, self.global_step)
                     writer.add_scalar(f'return/vec_discounted_return_{j}/agent_{agent.id}', d_val, self.global_step)
             self.archive.add(copy.deepcopy(agent), disc_vec_return)
+
+            r_time = -200.0
+            r_ener_f = -200.0
+            r_ener_b = -200.0
+            if self.reward_dim == 2:
+                r_ener_f = vec_return[0]
+                r_ener_b = vec_return[1]
+            elif self.reward_dim == 3:
+                r_time = vec_return[0]
+                r_ener_f = vec_return[1]
+                r_ener_b = vec_return[2]
+
+            import time as time_mod
+            elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
+            t_trained = self.timesteps_trained[agent.id] if hasattr(self, 'timesteps_trained') else 0
+            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{agent.id},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f}\n")
+
+        if pf_store is not None:
+            history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv")
+            file_exists = os.path.isfile(history_file)
+            with open(history_file, "a", encoding="utf-8") as f:
+                if not file_exists:
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time\n")
+                for row in history_rows:
+                    f.write(row)
+
+        if writer is not None:
+            import time as time_mod
+            elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
+            writer.add_scalar('eval/training_time', elapsed, self.global_step)
 
         front = self.archive.evaluations
         hv = log_metrics(front, ref_point=ref_point, known_pareto_front=known_pareto_front,
@@ -332,6 +365,8 @@ class MOSAC(Agent):
                 self.agents[agent_idx].collect_sample(self.replay_buffer)
                 self.global_step += 1
                 remaining -= 1
+                if hasattr(self, 'timesteps_trained'):
+                    self.timesteps_trained[agent_idx] += 1
             self._agent_rr_idx = (self._agent_rr_idx + step_count) % n_agents
 
             if self.replay_buffer.size < self.batch_size:
@@ -352,6 +387,8 @@ class MOSAC(Agent):
         """
         remaining = timesteps
         agent = self.agents[agent_idx]
+        if hasattr(self, 'timesteps_trained'):
+            self.timesteps_trained[agent_idx] += timesteps
         while remaining > 0:
             agent.collect_sample(self.replay_buffer)
             self.global_step += 1
@@ -507,6 +544,8 @@ class MOSAC(Agent):
             log_verbose=log_verbose
         )
 
+        self.timesteps_trained = [0] * len(self.agents)
+        self.heuristic_name = heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin"
         active_tasks = [{'id': idx, 'agent': agent, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'weight': agent.weights} for idx, agent in enumerate(self.agents)]
         
         for t in active_tasks:

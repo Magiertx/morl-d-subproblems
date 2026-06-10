@@ -385,12 +385,52 @@ class MOPPO(Agent):
             save_fronts=save_fronts, pf_store=pf_store)
         print(f'Hypervolume @ step 0: {round(hv)}')
 
+        all_samples = list(self.initial_samples)
+
         # Per-subproblem state used by the heuristic. Indexed by sample_id.
         active_tasks = [
-            {'id': idx, 'scalar_history': [-1000.0], 'stagnation_count': 0, 'active': True}
+            {'id': idx, 'scalar_history': [-1000.0], 'stagnation_count': 0, 'active': True, 'timesteps_trained': 0}
             for idx in range(len(self.initial_samples))
         ]
-        all_samples = list(self.initial_samples)
+
+        import time as time_mod
+        start_time = time_mod.perf_counter()
+
+        def _log_history(spent_budget):
+            import os
+            elapsed = time_mod.perf_counter() - start_time
+            history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv") if pf_store else None
+            if not history_file:
+                return
+            file_exists = os.path.isfile(history_file)
+            with open(history_file, "a", encoding="utf-8") as f:
+                if not file_exists:
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time\n")
+                h_name = heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin"
+                for i, task in enumerate(active_tasks):
+                    sample = all_samples[i]
+                    if hasattr(sample, 'objs') and sample.objs is not None and not np.array_equal(sample.objs, -np.inf):
+                        objs = sample.objs
+                    else:
+                        objs = np.zeros(self.reward_dim)
+                    
+                    r_time = -200.0
+                    r_ener_f = -200.0
+                    r_ener_b = -200.0
+                    if self.reward_dim == 2:
+                        r_ener_f = objs[0]
+                        r_ener_b = objs[1]
+                    elif self.reward_dim == 3:
+                        r_time = objs[0]
+                        r_ener_f = objs[1]
+                        r_ener_b = objs[2]
+                    
+                    scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
+                    f.write(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f}\n")
+            if writer:
+                writer.add_scalar("eval/training_time", elapsed, global_step=spent_budget)
+
+        _log_history(0)
 
         # ── Persistent pool for the entire training run ──────────────────────
         with Pool(processes=pool_size) as pool:
@@ -471,6 +511,7 @@ class MOPPO(Agent):
 
                     scalar_val = float(np.dot(latest.objs, latest.weights))
                     task = active_tasks[real_id]
+                    task['timesteps_trained'] += this_update * steps_per_task_iteration
                     prev_s = task['scalar_history'][-1]
                     task['stagnation_count'] = 0 if scalar_val > prev_s + 0.5 else task['stagnation_count'] + 1
                     task['scalar_history'].append(scalar_val)
@@ -493,6 +534,7 @@ class MOPPO(Agent):
                         global_step=self.global_step,
                         writer=writer, log=self.log,
                         save_fronts=save_fronts, pf_store=pf_store)
+                    _log_history(self.global_step)
                     print(f'Hypervolume @ step {self.global_step}: {round(hv)}')
                     next_eval_timestep += eval_timesteps
 
@@ -505,6 +547,7 @@ class MOPPO(Agent):
                 global_step=self.global_step,
                 writer=writer, log=self.log,
                 save_fronts=save_fronts, pf_store=pf_store)
+            _log_history(self.global_step)
             print(f'Hypervolume @ step {self.global_step}: {round(hv)}')
 
         # Pool is now closed (context manager exited)
