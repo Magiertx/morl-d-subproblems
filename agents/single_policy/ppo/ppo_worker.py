@@ -17,16 +17,20 @@ def evaluation(
         eval_seed: int,
         eval_gamma: float,
         max_episode_steps: int
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Run a deterministic evaluation of `sample.actor_critic` in a single-copy gym environment.
+
+    Returns the mean discounted objective vector and the per-episode
+    objective vectors (shape `(eval_num, reward_dim)`); the latter feed
+    the probability-of-improvement signal (TODO G2).
     """
     env = mo_gym.make(env_id, max_episode_steps=max_episode_steps)
     actor_critic = sample.actor_critic
     actor_critic.training = False
     ob_rms = sample.env_params.get('ob_rms', None)
 
-    total_obj = np.zeros(reward_dim, dtype=float)
+    episode_objs = np.zeros((eval_num, reward_dim), dtype=float)
 
     with torch.no_grad():
         for i in range(eval_num):
@@ -51,12 +55,12 @@ def evaluation(
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
-                total_obj += discounted_gamma * reward
+                episode_objs[i] += discounted_gamma * reward
                 discounted_gamma *= eval_gamma
                 obs = next_obs
     actor_critic.training = True
     env.close()
-    return total_obj / eval_num
+    return episode_objs.mean(axis=0), episode_objs
 
 def ppo_worker(sample_id: int,
                sample,
@@ -159,8 +163,8 @@ def ppo_worker(sample_id: int,
     # ── Evaluation after the chunk ──────────────────────────────────
     sample_out = Sample(env_params, deepcopy(actor_critic), deepcopy(agent),
                         deepcopy(weights), sample.learning_rate, sample.eps)
-    disc_obj = evaluation(sample_out, env_id, reward_dim,
-                          eval_rep, eval_seed, eval_gamma, max_episode_steps)
+    disc_obj, episode_objs = evaluation(sample_out, env_id, reward_dim,
+                                        eval_rep, eval_seed, eval_gamma, max_episode_steps)
     sample_out.objs = disc_obj
     offspring_list.append(sample_out)
 
@@ -169,4 +173,5 @@ def ppo_worker(sample_id: int,
     return {
         'task_id':         sample_id,
         'offspring_batch': np.array(offspring_list),
+        'eval_episode_objs': episode_objs,
     }

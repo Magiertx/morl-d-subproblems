@@ -25,6 +25,17 @@ from agents.single_policy.ppo.a2c_ppo.model import Policy
 from agents.single_policy.ppo.a2c_ppo.envs import make_vec_envs
 from agents.single_policy.ppo.external_pareto import ExternalPareto
 
+# Thesis signal extensions (G1-G3) live in the root repo (/heuristics/signals.py)
+# and are only importable when training is launched through the entry scripts
+# (train_mo_ppo.py adds the root to sys.path). Keep the framework usable
+# standalone by degrading gracefully to the base signal set.
+try:
+    from heuristics.signals import (norm_rolling_improvement, probability_of_improvement,
+                                    dominance_rank, dominance_improvement)
+    _EXT_SIGNALS = True
+except ImportError:
+    _EXT_SIGNALS = False
+
 def _available_cpus():
     if 'SLURM_CPUS_PER_TASK' in os.environ:
         return int(os.environ['SLURM_CPUS_PER_TASK'])
@@ -322,7 +333,7 @@ class MOPPO(Agent):
         """Performance signals consumed by dynamic budget-allocation heuristics."""
         scalars = [t['scalar_history'][-1] if t['scalar_history'] else -200 for t in active_tasks]
         gaps = [max(scalars + [-200]) - s for s in scalars]
-        return {
+        signals = {
             'scalar_rewards': scalars,
             'performance_gaps': gaps,
             'improvement_rates': [
@@ -332,6 +343,19 @@ class MOPPO(Agent):
             'stagnation_counts': [t['stagnation_count'] for t in active_tasks],
             'scalar_histories': [list(t['scalar_history']) for t in active_tasks],
         }
+        if _EXT_SIGNALS:
+            signals['norm_improvement_rates'] = [
+                norm_rolling_improvement(t['scalar_history']) for t in active_tasks]
+            signals['prob_improvements'] = [
+                probability_of_improvement(t['eval_returns_history'][-2], t['eval_returns_history'][-1])
+                if len(t.get('eval_returns_history', [])) >= 2 else 0.5
+                for t in active_tasks]
+            signals['dominance_ranks'] = [
+                t['dominance_history'][-1] if t.get('dominance_history') else 0
+                for t in active_tasks]
+            signals['dominance_improvements'] = [
+                dominance_improvement(t.get('dominance_history', [])) for t in active_tasks]
+        return signals
 
     def train(
             self,
@@ -389,7 +413,8 @@ class MOPPO(Agent):
 
         # Per-subproblem state used by the heuristic. Indexed by sample_id.
         active_tasks = [
-            {'id': idx, 'scalar_history': [-1000.0], 'stagnation_count': 0, 'active': True, 'timesteps_trained': 0}
+            {'id': idx, 'scalar_history': [-1000.0], 'stagnation_count': 0, 'active': True, 'timesteps_trained': 0,
+             'eval_returns_history': [], 'dominance_history': []}
             for idx in range(len(self.initial_samples))
         ]
 
@@ -405,7 +430,7 @@ class MOPPO(Agent):
             file_exists = os.path.isfile(history_file)
             with open(history_file, "a", encoding="utf-8") as f:
                 if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time\n")
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars\n")
                 h_name = heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin"
                 for i, task in enumerate(active_tasks):
                     sample = all_samples[i]
@@ -426,7 +451,9 @@ class MOPPO(Agent):
                         r_ener_b = objs[2]
                     
                     scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
-                    f.write(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f}\n")
+                    # Latest individual eval-episode returns (';'-joined, CSV-safe) — G2 logging.
+                    eval_scalars = ";".join(f"{v:.4f}" for v in task['eval_returns_history'][-1]) if task.get('eval_returns_history') else ""
+                    f.write(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars}\n")
             if writer:
                 writer.add_scalar("eval/training_time", elapsed, global_step=spent_budget)
 
@@ -516,9 +543,23 @@ class MOPPO(Agent):
                     task['stagnation_count'] = 0 if scalar_val > prev_s + 0.5 else task['stagnation_count'] + 1
                     task['scalar_history'].append(scalar_val)
 
+                    # Individual eval-episode returns, scalarized on the task
+                    # weight — feeds probability of improvement (G2).
+                    if r.get('eval_episode_objs') is not None:
+                        w_np = latest.weights.cpu().numpy() if hasattr(latest.weights, 'cpu') else np.asarray(latest.weights)
+                        episode_scalars = [float(np.dot(ep, w_np)) for ep in r['eval_episode_objs']]
+                        task['eval_returns_history'].append(episode_scalars)
+
                 # Update archive
                 for sample in all_sample_batch:
                     self.ep.update([sample])
+
+                # Dominance rank of each trained task vs. the updated archive (G3).
+                if _EXT_SIGNALS:
+                    for r in results:
+                        task = active_tasks[r['task_id']]
+                        task['dominance_history'].append(
+                            dominance_rank(all_samples[r['task_id']].objs, self.ep.obj_batch))
 
                 # Advance counters
                 current_iteration += this_update

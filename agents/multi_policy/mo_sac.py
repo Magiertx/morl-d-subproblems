@@ -18,6 +18,17 @@ from misc.evaluation import log_metrics, evaluate_single_weight
 from agents.single_policy.sac_continues_action import SACContinues
 from misc.weights import generate_das_dennis_weights, generate_layer_energy_weights, generate_dirichlet_weights
 
+# Thesis signal extensions (G1-G3) live in the root repo (/heuristics/signals.py)
+# and are only importable when training is launched through the entry scripts
+# (train_mo_sac.py adds the root to sys.path). Keep the framework usable
+# standalone by degrading gracefully to the base signal set.
+try:
+    from heuristics.signals import (norm_rolling_improvement, probability_of_improvement,
+                                    dominance_rank, dominance_improvement)
+    _EXT_SIGNALS = True
+except ImportError:
+    _EXT_SIGNALS = False
+
 
 class MOSAC(Agent):
     def __init__(self,
@@ -303,11 +314,23 @@ class MOSAC(Agent):
                          ):
         import os
         h_name = getattr(self, 'heuristic_name', 'RoundRobin')
+        if not hasattr(self, '_eval_returns_histories'):
+            # Per-agent signal histories keyed by agent.id (G2/G3).
+            self._eval_returns_histories = {}
+            self._dominance_histories = {}
         history_rows = []
-        for agent in agents:
-            scalarized_return, scalarized_discounted_return, vec_return, disc_vec_return = (
+        agent_disc_returns = {}
+        # NOTE: agent.id is seed-based (seed + position, see _create_new_agent);
+        # task bookkeeping (active_tasks, timesteps_trained, history.csv) is
+        # positional — always key by the enumerate position here.
+        for pos, agent in enumerate(agents):
+            scalarized_return, scalarized_discounted_return, vec_return, disc_vec_return, episode_evals = (
                 evaluate_single_weight(agent, env=eval_env, w=agent.weights.cpu().numpy(), rep=eval_rep,
-                                       seed=eval_seed, eval_gamma=eval_gamma))
+                                       seed=eval_seed, eval_gamma=eval_gamma, return_episodes=True))
+            # Individual eval-episode returns (undiscounted scalarized) — G2.
+            episode_scalars = [float(e[0]) for e in episode_evals]
+            self._eval_returns_histories.setdefault(pos, []).append(episode_scalars)
+            agent_disc_returns[pos] = disc_vec_return
             if log_verbose > 0:
                 writer.add_scalar(f'return/scalarized_return/agent_{agent.id}', scalarized_return, self.global_step)
                 writer.add_scalar(f'return/scalarized_discounted_return/agent_{agent.id}', scalarized_discounted_return,
@@ -330,15 +353,22 @@ class MOSAC(Agent):
 
             import time as time_mod
             elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
-            t_trained = self.timesteps_trained[agent.id] if hasattr(self, 'timesteps_trained') else 0
-            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{agent.id},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f}\n")
+            t_trained = self.timesteps_trained[pos] if hasattr(self, 'timesteps_trained') else 0
+            eval_scalars = ";".join(f"{v:.4f}" for v in episode_scalars)
+            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars}\n")
+
+        # Dominance rank of every agent vs. the fully updated archive (G3).
+        if _EXT_SIGNALS:
+            for pos in range(len(agents)):
+                self._dominance_histories.setdefault(pos, []).append(
+                    dominance_rank(agent_disc_returns[pos], self.archive.evaluations))
 
         if pf_store is not None:
             history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv")
             file_exists = os.path.isfile(history_file)
             with open(history_file, "a", encoding="utf-8") as f:
                 if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time\n")
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars\n")
                 for row in history_rows:
                     f.write(row)
 
@@ -438,13 +468,27 @@ class MOSAC(Agent):
         """
         scalars = [t['scalar_history'][-1] if t['scalar_history'] else -200 for t in active_tasks]
         gaps = [max(scalars + [-200]) - s for s in scalars]
-        return {
+        signals = {
             'scalar_rewards': scalars,
             'performance_gaps': gaps,
             'improvement_rates': [(t['scalar_history'][-1] - t['scalar_history'][-2]) if len(t['scalar_history']) >= 2 else 0.0 for t in active_tasks],
             'stagnation_counts': [t['stagnation_count'] for t in active_tasks],
             'scalar_histories': [list(t['scalar_history']) for t in active_tasks]
         }
+        if _EXT_SIGNALS:
+            err = getattr(self, '_eval_returns_histories', {})
+            dom = getattr(self, '_dominance_histories', {})
+            signals['norm_improvement_rates'] = [
+                norm_rolling_improvement(t['scalar_history']) for t in active_tasks]
+            signals['prob_improvements'] = [
+                probability_of_improvement(err[t['id']][-2], err[t['id']][-1])
+                if len(err.get(t['id'], [])) >= 2 else 0.5
+                for t in active_tasks]
+            signals['dominance_ranks'] = [
+                dom[t['id']][-1] if dom.get(t['id']) else 0 for t in active_tasks]
+            signals['dominance_improvements'] = [
+                dominance_improvement(dom.get(t['id'], [])) for t in active_tasks]
+        return signals
 
     def train(
             self,
@@ -522,6 +566,9 @@ class MOSAC(Agent):
                 Base file name used for all saved outputs including logs,
                 configurations, models, and Pareto front files.
         """
+        import time as time_mod
+        self.start_time = time_mod.perf_counter()
+
         runs_path, model_path, config_path, pf_store = setup_directories(log_dir, file_name, save_fronts, save_models)
 
         self.save_config(config_path, file_name)

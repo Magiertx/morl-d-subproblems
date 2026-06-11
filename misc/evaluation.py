@@ -42,8 +42,8 @@ def _evaluate_episode(agent: Agent, env: gym.Env, w: np.ndarray, scalarization=n
 
 
 def evaluate_single_weight(agent: Agent, env: gym.Env, w: np.ndarray, scalarization=np.dot, rep: int = 5,
-                           eval_gamma: float = 0.99, seed: int = 42, obs_rms: any = None) -> tuple[
-    floating[Any], floating[Any], Any, Any]:
+                           eval_gamma: float = 0.99, seed: int = 42, obs_rms: any = None,
+                           return_episodes: bool = False):
     evals = [
         _evaluate_episode(agent=agent, env=env, w=w, scalarization=scalarization, eval_gamma=eval_gamma, seed=seed + i,
                           obs_rms=obs_rms)
@@ -52,6 +52,10 @@ def evaluate_single_weight(agent: Agent, env: gym.Env, w: np.ndarray, scalarizat
     avg_scalarized_discounted_return = np.mean([eval[1] for eval in evals])
     avg_vec_return = np.mean([eval[2] for eval in evals], axis=0)
     avg_disc_vec_return = np.mean([eval[3] for eval in evals], axis=0)
+    if return_episodes:
+        # Per-episode tuples (scalarized, scalarized_discounted, vec, disc_vec) —
+        # needed for the probability-of-improvement signal (TODO G2).
+        return avg_scalarized_return, avg_scalarized_discounted_return, avg_vec_return, avg_disc_vec_return, evals
     return avg_scalarized_return, avg_scalarized_discounted_return, avg_vec_return, avg_disc_vec_return
 
 
