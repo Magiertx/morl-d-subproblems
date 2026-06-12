@@ -576,6 +576,10 @@ class MOSAC(Agent):
         eval_env.action_space.seed(eval_seed)
         eval_env.observation_space.seed(eval_seed)
 
+        # Set before the initial evaluation so the step-0 history rows
+        # already carry the correct heuristic label.
+        self.heuristic_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
+
         self._eval_all_agents(
             self.agents,
             eval_env=eval_env,
@@ -592,7 +596,6 @@ class MOSAC(Agent):
         )
 
         self.timesteps_trained = [0] * len(self.agents)
-        self.heuristic_name = heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin"
         active_tasks = [{'id': idx, 'agent': agent, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'weight': agent.weights} for idx, agent in enumerate(self.agents)]
         
         for t in active_tasks:

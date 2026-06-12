@@ -7,6 +7,11 @@ from heuristics.dynamic_heuristics import (
     BanditHeuristic,
     EliminationHeuristic,
     StagnationBasedHeuristic,
+    MLFQHeuristic,
+    MarginalValueHeuristic,
+    ProportionalShareHeuristic,
+    CMuRuleHeuristic,
+    SELECTABLE_SIGNAL_KEYS,
 )
 
 import os
@@ -35,8 +40,11 @@ def main():
     parser.add_argument('--init_w_sampling', type=str, default='uniform',
                         help='Initial weight sampling strategy.')
     parser.add_argument('--heuristic', type=str, default='round-robin',
-                        choices=['round-robin', 'rank-based', 'bandit', 'elimination', 'stagnation-based'],
-                        help='Budget allocation heuristic to use during training.')
+                        help='Budget allocation heuristic, optionally with a signal variant '
+                             '"<name>:<signal_key>" (B2), e.g. "bandit:norm_improvement_rates". '
+                             'Names: round-robin, rank-based, bandit, elimination, stagnation-based, '
+                             'mlfq, marginal-value, proportional-share, cmu-rule. '
+                             f'Signal keys: {", ".join(SELECTABLE_SIGNAL_KEYS)}.')
 
     args = parser.parse_args()
 
@@ -46,9 +54,29 @@ def main():
         'bandit': (BanditHeuristic, {'exploration_constant': 1.0}),
         'elimination': (EliminationHeuristic, {'window_size': 5}),
         'stagnation-based': (StagnationBasedHeuristic, {}),
+        'mlfq': (MLFQHeuristic, {}),
+        'marginal-value': (MarginalValueHeuristic, {}),
+        'proportional-share': (ProportionalShareHeuristic, {}),
+        'cmu-rule': (CMuRuleHeuristic, {}),
     }
-    h_cls, h_kwargs = heuristic_map[args.heuristic]
+    # Heuristics whose identity IS their signal — no ":<signal_key>" variant.
+    fixed_signal = ('round-robin', 'stagnation-based', 'mlfq')
+
+    h_name, _, h_signal = args.heuristic.partition(':')
+    if h_name not in heuristic_map:
+        parser.error(f"Unknown heuristic '{h_name}'. Valid: {', '.join(heuristic_map)}")
+    h_cls, h_kwargs = heuristic_map[h_name]
+    if h_signal:
+        if h_name in fixed_signal:
+            parser.error(f"Heuristic '{h_name}' does not support a signal variant.")
+        # cmu-rule: the variant selects the efficiency term mu; the urgency
+        # term c stays at its default (constructor arg c_signal_key).
+        signal_kwarg = 'mu_signal_key' if h_name == 'cmu-rule' else 'signal_key'
+        h_kwargs = {**h_kwargs, signal_kwarg: h_signal}
     heuristic_obj = h_cls(**h_kwargs)
+    # Label lands in the history.csv 'heuristic' column so signal variants
+    # stay distinguishable in the analysis (read by the orchestrator).
+    heuristic_obj.label = h_cls.__name__.replace('Heuristic', '') + (f':{h_signal}' if h_signal else '')
     base_dir = os.path.dirname(os.path.abspath(__file__))
     env_config = read_env_config(os.path.join(base_dir, 'configs', 'environment_configs.json'))
     env_id = env_config[args.env]['env_id']

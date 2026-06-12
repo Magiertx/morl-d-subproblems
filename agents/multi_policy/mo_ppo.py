@@ -431,7 +431,7 @@ class MOPPO(Agent):
             with open(history_file, "a", encoding="utf-8") as f:
                 if not file_exists:
                     f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars\n")
-                h_name = heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin"
+                h_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
                 for i, task in enumerate(active_tasks):
                     sample = all_samples[i]
                     if hasattr(sample, 'objs') and sample.objs is not None and not np.array_equal(sample.objs, -np.inf):
