@@ -119,6 +119,11 @@ def main():
 
     log_dir = f'{agent.name}/{args.env}/{args.init_w_sampling}/k_{args.num_subproblems:04d}/ws/s_{args.seed:04d}'
 
+    # Heuristik-Label im Dateinamen, damit Laeufe verschiedener Heuristiken mit
+    # gleichem (env, k, seed) ihre fronts/*.npz + config nicht ueberschreiben
+    # (Windows-sicher: ':' ist in Dateinamen verboten -> '-').
+    file_name = f"{agent.name}__{heuristic_obj.label.replace(':', '-')}"
+
     agent.train(
         total_timesteps=args.total_timesteps,
         eval_env=eval_env,
@@ -133,6 +138,7 @@ def main():
         save_fronts=True,
         save_models=False,
         log_dir=log_dir,
+        file_name=file_name,
         log_verbose=0
     )
 
