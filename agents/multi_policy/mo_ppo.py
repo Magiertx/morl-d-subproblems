@@ -643,6 +643,11 @@ class MOPPO(Agent):
                         save_fronts=save_fronts, pf_store=pf_store)
                     _log_history(self.global_step)
                     print(f'Hypervolume @ step {self.global_step}: {round(hv)}')
+                    elapsed_min = (time_mod.perf_counter() - start_time) / 60.0
+                    pct = 100.0 * current_timestep / total_timesteps
+                    eta_min = elapsed_min * (total_timesteps - current_timestep) / max(1, current_timestep)
+                    print(f'[PROGRESS] {current_timestep:,}/{total_timesteps:,} steps '
+                          f'({pct:.1f}%) | {elapsed_min:.1f} min | ETA ~{eta_min:.1f} min', flush=True)
                     next_eval_timestep += eval_timesteps
 
             # ── Final evaluation ──────────────────────────────────────────────

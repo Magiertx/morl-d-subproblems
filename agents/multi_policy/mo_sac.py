@@ -735,6 +735,12 @@ class MOSAC(Agent):
                 chosen['stagnation_count'] = 0 if s > prev_s + 0.5 else chosen['stagnation_count'] + 1
                 chosen['scalar_history'].append(s)
 
+            elapsed_min = (time_mod.perf_counter() - self.start_time) / 60.0
+            pct = 100.0 * self.global_step / total_timesteps
+            eta_min = elapsed_min * (total_timesteps - self.global_step) / max(1, self.global_step)
+            print(f'[PROGRESS] {self.global_step:,}/{total_timesteps:,} steps '
+                  f'({pct:.1f}%) | {elapsed_min:.1f} min | ETA ~{eta_min:.1f} min', flush=True)
+
         self.env.close()
         eval_env.close()
 
