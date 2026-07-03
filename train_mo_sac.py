@@ -39,6 +39,9 @@ def main():
                         help='Number of MO-SAC subproblems / weight vectors (policies) to optimize in parallel.')
     parser.add_argument('--init_w_sampling', type=str, default='uniform',
                         help='Initial weight sampling strategy.')
+    parser.add_argument('--eval_timesteps', type=int, default=10_000,
+                        help='Chunk size in env steps between heuristic decisions / evaluations '
+                             '(SAC is step-based, any value works; supervisor target range 1k-5k).')
     parser.add_argument('--heuristic', type=str, default='round-robin',
                         help='Budget allocation heuristic, optionally with a signal variant '
                              '"<name>:<signal_key>" (B2), e.g. "bandit:norm_improvement_rates". '
@@ -129,7 +132,7 @@ def main():
         eval_env=eval_env,
         ref_point=ref_point,
         heuristic=heuristic_obj,
-        eval_timesteps=10_000,
+        eval_timesteps=args.eval_timesteps,
         known_pareto_front=None,
         num_eval_weights=100,
         eval_rep=5,

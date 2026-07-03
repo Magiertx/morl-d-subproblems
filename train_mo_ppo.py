@@ -42,8 +42,13 @@ def main():
                         help='Total number of environment interaction steps for training.')
     parser.add_argument('--num_subproblems', type=int, default=6,
                         help='Number of MO-SAC subproblems / weight vectors (policies) to optimize in parallel.')
-    parser.add_argument('--init_w_sampling', type=str, default='uniform', 
+    parser.add_argument('--init_w_sampling', type=str, default='uniform',
                         help='Initial weight sampling strategy.')
+    parser.add_argument('--eval_timesteps', type=int, default=10_000,
+                        help='Chunk size in env steps between heuristic decisions / evaluations. '
+                             'Note: PPO rounds allocations down to multiples of '
+                             'num_processes*num_steps (currently 8*512=4096), so values below '
+                             '4096 are not reachable; 4096 gives one rollout per decision.')
     parser.add_argument('--heuristic', type=str, default='round-robin',
                         help='Budget allocation heuristic, optionally with a signal variant '
                              '"<name>:<signal_key>" (B2), e.g. "bandit:norm_improvement_rates". '
@@ -138,7 +143,7 @@ def main():
 
     agent.train(
         total_timesteps=args.total_timesteps,
-        eval_timesteps=10_000,
+        eval_timesteps=args.eval_timesteps,
         ref_point=ref_point,
         heuristic=heuristic_obj,
         known_pareto_front=None,
