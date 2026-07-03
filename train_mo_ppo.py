@@ -3,8 +3,10 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from heuristics.dynamic_heuristics import (
     RoundRobinHeuristic,
+    RandomAllocationHeuristic,
     RankBasedHeuristic,
     BanditHeuristic,
+    RottingBanditHeuristic,
     EliminationHeuristic,
     StagnationBasedHeuristic,
     MLFQHeuristic,
@@ -52,16 +54,19 @@ def main():
     parser.add_argument('--heuristic', type=str, default='round-robin',
                         help='Budget allocation heuristic, optionally with a signal variant '
                              '"<name>:<signal_key>" (B2), e.g. "bandit:norm_improvement_rates". '
-                             'Names: round-robin, rank-based, bandit, elimination, stagnation-based, '
-                             'mlfq, marginal-value, proportional-share, cmu-rule. '
+                             'Names: round-robin, random, rank-based, bandit, rotting-bandit, '
+                             'elimination, stagnation-based, mlfq, marginal-value, '
+                             'proportional-share, cmu-rule. '
                              f'Signal keys: {", ".join(SELECTABLE_SIGNAL_KEYS)}.')
 
     args = parser.parse_args()
 
     heuristic_map = {
         'round-robin': (RoundRobinHeuristic, {}),
+        'random': (RandomAllocationHeuristic, {}),
         'rank-based': (RankBasedHeuristic, {}),
         'bandit': (BanditHeuristic, {'exploration_constant': 1.0}),
+        'rotting-bandit': (RottingBanditHeuristic, {}),
         'elimination': (EliminationHeuristic, {'window_size': 5}),
         'stagnation-based': (StagnationBasedHeuristic, {}),
         'mlfq': (MLFQHeuristic, {}),
@@ -70,7 +75,7 @@ def main():
         'cmu-rule': (CMuRuleHeuristic, {}),
     }
     # Heuristics whose identity IS their signal — no ":<signal_key>" variant.
-    fixed_signal = ('round-robin', 'stagnation-based', 'mlfq')
+    fixed_signal = ('round-robin', 'random', 'stagnation-based', 'mlfq')
 
     h_name, _, h_signal = args.heuristic.partition(':')
     if h_name not in heuristic_map:
