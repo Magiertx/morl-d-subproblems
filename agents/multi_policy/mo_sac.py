@@ -358,7 +358,7 @@ class MOSAC(Agent):
             rp = getattr(self, '_run_params', {})
             params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
                       f"{rp.get('total_timesteps', '')},{rp.get('eval_timesteps', '')},"
-                      f"{rp.get('warmup', 0)},{rp.get('warmup_steps', 0)}")
+                      f"{rp.get('warmup', 0)},{rp.get('warmup_steps', 0)},{rp.get('host', '')}")
             history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars},{params}\n")
 
         # Dominance rank of every agent vs. the fully updated archive (G3).
@@ -372,7 +372,7 @@ class MOSAC(Agent):
             file_exists = os.path.isfile(history_file)
             with open(history_file, "a", encoding="utf-8") as f:
                 if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps\n")
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n")
                 for row in history_rows:
                     f.write(row)
 
@@ -585,11 +585,13 @@ class MOSAC(Agent):
         self.heuristic_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
         # Run parameters mirrored into every history.csv row so runs with
         # different settings stay distinguishable in the pooled results.
+        import platform
         self._run_params = {
             'total_timesteps': total_timesteps,
             'eval_timesteps': eval_timesteps,
             'warmup': int(bool(getattr(heuristic, 'warmup', False))),
             'warmup_steps': int(getattr(heuristic, 'warmup_steps', 0) or 0),
+            'host': platform.node(),
         }
 
         self._eval_all_agents(
