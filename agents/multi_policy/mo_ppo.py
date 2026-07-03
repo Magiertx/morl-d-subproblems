@@ -489,7 +489,11 @@ class MOPPO(Agent):
                     if not active_list:
                         break
 
-                    signals = self._compute_signals(active_tasks)
+                    # Signals MUST be computed over exactly the list handed to the
+                    # heuristic: all heuristics index them positionally, so a
+                    # full-k array vs. filtered active_list shifts every index
+                    # after the first elimination (IndexError / wrong task).
+                    signals = self._compute_signals(active_list)
                     for i, t in enumerate(active_list):
                         if heuristic.should_deactivate(t, i, signals):
                             t['active'] = False
@@ -499,7 +503,7 @@ class MOPPO(Agent):
                     if not active_list:
                         break
 
-                    signals = self._compute_signals(active_tasks)
+                    signals = self._compute_signals(active_list)
                     chosen_idx = heuristic.select_next_task(active_list, signals)
                     chosen_real_id = active_list[chosen_idx]['id']
                     selected_ids = [chosen_real_id]

@@ -609,7 +609,10 @@ class MOSAC(Agent):
                 active_list = [t for t in active_tasks if t['active']]
                 if not active_list: break
 
-                signals = self._compute_signals(active_tasks)
+                # Signals MUST be computed over exactly the list handed to the
+                # heuristic (positional indexing) — full-k arrays shift every
+                # index once a task was eliminated (IndexError / wrong task).
+                signals = self._compute_signals(active_list)
                 for i, t in enumerate(active_list):
                     if heuristic.should_deactivate(t, i, signals):
                         t['active'] = False
@@ -618,7 +621,7 @@ class MOSAC(Agent):
                 active_list = [t for t in active_tasks if t['active']]
                 if not active_list: break
 
-                signals = self._compute_signals(active_tasks)
+                signals = self._compute_signals(active_list)
                 chosen_idx = heuristic.select_next_task(active_list, signals)
                 chosen = active_list[chosen_idx]
                 
