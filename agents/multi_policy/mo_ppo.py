@@ -430,8 +430,14 @@ class MOPPO(Agent):
             file_exists = os.path.isfile(history_file)
             with open(history_file, "a", encoding="utf-8") as f:
                 if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars\n")
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps\n")
                 h_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
+                # Run parameters mirrored into every row so runs with different
+                # settings stay distinguishable in the pooled results.
+                run_params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
+                              f"{total_timesteps},{eval_timesteps},"
+                              f"{int(bool(getattr(heuristic, 'warmup', False)))},"
+                              f"{int(getattr(heuristic, 'warmup_steps', 0) or 0)}")
                 for i, task in enumerate(active_tasks):
                     sample = all_samples[i]
                     if hasattr(sample, 'objs') and sample.objs is not None and not np.array_equal(sample.objs, -np.inf):
@@ -453,7 +459,7 @@ class MOPPO(Agent):
                     scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
                     # Latest individual eval-episode returns (';'-joined, CSV-safe) — G2 logging.
                     eval_scalars = ";".join(f"{v:.4f}" for v in task['eval_returns_history'][-1]) if task.get('eval_returns_history') else ""
-                    f.write(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars}\n")
+                    f.write(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars},{run_params}\n")
             if writer:
                 writer.add_scalar("eval/training_time", elapsed, global_step=spent_budget)
 

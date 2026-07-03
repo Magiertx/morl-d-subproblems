@@ -355,7 +355,11 @@ class MOSAC(Agent):
             elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
             t_trained = self.timesteps_trained[pos] if hasattr(self, 'timesteps_trained') else 0
             eval_scalars = ";".join(f"{v:.4f}" for v in episode_scalars)
-            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars}\n")
+            rp = getattr(self, '_run_params', {})
+            params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
+                      f"{rp.get('total_timesteps', '')},{rp.get('eval_timesteps', '')},"
+                      f"{rp.get('warmup', 0)},{rp.get('warmup_steps', 0)}")
+            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars},{params}\n")
 
         # Dominance rank of every agent vs. the fully updated archive (G3).
         if _EXT_SIGNALS:
@@ -368,7 +372,7 @@ class MOSAC(Agent):
             file_exists = os.path.isfile(history_file)
             with open(history_file, "a", encoding="utf-8") as f:
                 if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars\n")
+                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps\n")
                 for row in history_rows:
                     f.write(row)
 
@@ -579,6 +583,14 @@ class MOSAC(Agent):
         # Set before the initial evaluation so the step-0 history rows
         # already carry the correct heuristic label.
         self.heuristic_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
+        # Run parameters mirrored into every history.csv row so runs with
+        # different settings stay distinguishable in the pooled results.
+        self._run_params = {
+            'total_timesteps': total_timesteps,
+            'eval_timesteps': eval_timesteps,
+            'warmup': int(bool(getattr(heuristic, 'warmup', False))),
+            'warmup_steps': int(getattr(heuristic, 'warmup_steps', 0) or 0),
+        }
 
         self._eval_all_agents(
             self.agents,
