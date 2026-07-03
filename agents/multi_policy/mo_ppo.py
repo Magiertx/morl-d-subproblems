@@ -45,6 +45,51 @@ def _available_cpus():
         return os.cpu_count() or 1
 
 
+def _locked_history_append(history_file: str, header: str, rows: list) -> None:
+    """Append rows to the shared history.csv under an exclusive lock file.
+
+    All heuristic runs of one (env, algo, k, seed) share a single history.csv;
+    on the SLURM cluster several of them may run concurrently, so both the
+    header existence check and the append must be serialized (otherwise:
+    duplicated headers mid-file / interleaved partial rows — review 2026-07-03).
+    Lock: O_CREAT|O_EXCL lock file (portable across Windows, Linux and NFS);
+    stale locks older than 60s are stolen, after 120s we write unlocked as a
+    last resort (losing lock safety beats losing the run's results).
+    """
+    import time as _time
+    lock_path = history_file + '.lock'
+    deadline = _time.time() + 120.0
+    fd = None
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if _time.time() - os.path.getmtime(lock_path) > 60.0:
+                    os.remove(lock_path)
+                    continue
+            except OSError:
+                pass
+            if _time.time() > deadline:
+                break
+            _time.sleep(0.05)
+    try:
+        write_header = not os.path.isfile(history_file) or os.path.getsize(history_file) == 0
+        with open(history_file, 'a', encoding='utf-8') as f:
+            if write_header:
+                f.write(header)
+            for row in rows:
+                f.write(row)
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
+
 class MOPPO(Agent):
     def __init__(
             self,
@@ -427,41 +472,42 @@ class MOPPO(Agent):
             history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv") if pf_store else None
             if not history_file:
                 return
-            file_exists = os.path.isfile(history_file)
-            with open(history_file, "a", encoding="utf-8") as f:
-                if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n")
-                h_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
-                # Run parameters mirrored into every row so runs with different
-                # settings stay distinguishable in the pooled results.
-                import platform
-                run_params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
-                              f"{total_timesteps},{eval_timesteps},"
-                              f"{int(bool(getattr(heuristic, 'warmup', False)))},"
-                              f"{int(getattr(heuristic, 'warmup_steps', 0) or 0)},"
-                              f"{platform.node()}")
-                for i, task in enumerate(active_tasks):
-                    sample = all_samples[i]
-                    if hasattr(sample, 'objs') and sample.objs is not None and not np.array_equal(sample.objs, -np.inf):
-                        objs = sample.objs
-                    else:
-                        objs = np.zeros(self.reward_dim)
-                    
-                    r_time = -200.0
-                    r_ener_f = -200.0
-                    r_ener_b = -200.0
-                    if self.reward_dim == 2:
-                        r_ener_f = objs[0]
-                        r_ener_b = objs[1]
-                    elif self.reward_dim == 3:
-                        r_time = objs[0]
-                        r_ener_f = objs[1]
-                        r_ener_b = objs[2]
-                    
-                    scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
-                    # Latest individual eval-episode returns (';'-joined, CSV-safe) — G2 logging.
-                    eval_scalars = ";".join(f"{v:.4f}" for v in task['eval_returns_history'][-1]) if task.get('eval_returns_history') else ""
-                    f.write(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars},{run_params}\n")
+            h_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
+            # Run parameters mirrored into every row so runs with different
+            # settings stay distinguishable in the pooled results.
+            import platform
+            run_params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
+                          f"{total_timesteps},{eval_timesteps},"
+                          f"{int(bool(getattr(heuristic, 'warmup', False)))},"
+                          f"{int(getattr(heuristic, 'warmup_steps', 0) or 0)},"
+                          f"{platform.node()}")
+            rows = []
+            for i, task in enumerate(active_tasks):
+                sample = all_samples[i]
+                if hasattr(sample, 'objs') and sample.objs is not None and not np.array_equal(sample.objs, -np.inf):
+                    objs = sample.objs
+                else:
+                    objs = np.zeros(self.reward_dim)
+
+                r_time = -200.0
+                r_ener_f = -200.0
+                r_ener_b = -200.0
+                if self.reward_dim == 2:
+                    r_ener_f = objs[0]
+                    r_ener_b = objs[1]
+                elif self.reward_dim == 3:
+                    r_time = objs[0]
+                    r_ener_f = objs[1]
+                    r_ener_b = objs[2]
+
+                scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
+                # Latest individual eval-episode returns (';'-joined, CSV-safe) — G2 logging.
+                eval_scalars = ";".join(f"{v:.4f}" for v in task['eval_returns_history'][-1]) if task.get('eval_returns_history') else ""
+                rows.append(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars},{run_params}\n")
+            _locked_history_append(
+                history_file,
+                "seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n",
+                rows)
             if writer:
                 writer.add_scalar("eval/training_time", elapsed, global_step=spent_budget)
 
@@ -502,9 +548,17 @@ class MOPPO(Agent):
                     # full-k array vs. filtered active_list shifts every index
                     # after the first elimination (IndexError / wrong task).
                     signals = self._compute_signals(active_list)
+                    # Never let a single deactivation sweep empty the pool: the
+                    # in-heuristic "last task" guards check the round-START
+                    # length, so simultaneous eliminations could kill every
+                    # task and silently end the run early (review 2026-07-03).
+                    remaining = len(active_list)
                     for i, t in enumerate(active_list):
+                        if remaining <= 1:
+                            break
                         if heuristic.should_deactivate(t, i, signals):
                             t['active'] = False
+                            remaining -= 1
                             print(f"--- Task {t['id']} ELIMINATED at {current_timestep} steps ---")
 
                     active_list = [t for t in active_tasks if t['active']]

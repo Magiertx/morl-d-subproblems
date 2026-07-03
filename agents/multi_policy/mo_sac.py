@@ -30,6 +30,51 @@ except ImportError:
     _EXT_SIGNALS = False
 
 
+def _locked_history_append(history_file: str, header: str, rows: list) -> None:
+    """Append rows to the shared history.csv under an exclusive lock file.
+
+    All heuristic runs of one (env, algo, k, seed) share a single history.csv;
+    on the SLURM cluster several of them may run concurrently, so both the
+    header existence check and the append must be serialized (otherwise:
+    duplicated headers mid-file / interleaved partial rows — review 2026-07-03).
+    Lock: O_CREAT|O_EXCL lock file (portable across Windows, Linux and NFS);
+    stale locks older than 60s are stolen, after 120s we write unlocked as a
+    last resort (losing lock safety beats losing the run's results).
+    """
+    import time as _time
+    lock_path = history_file + '.lock'
+    deadline = _time.time() + 120.0
+    fd = None
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if _time.time() - os.path.getmtime(lock_path) > 60.0:
+                    os.remove(lock_path)
+                    continue
+            except OSError:
+                pass
+            if _time.time() > deadline:
+                break
+            _time.sleep(0.05)
+    try:
+        write_header = not os.path.isfile(history_file) or os.path.getsize(history_file) == 0
+        with open(history_file, 'a', encoding='utf-8') as f:
+            if write_header:
+                f.write(header)
+            for row in rows:
+                f.write(row)
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
+
 class MOSAC(Agent):
     def __init__(self,
                  env_id: str,
@@ -320,6 +365,11 @@ class MOSAC(Agent):
             self._dominance_histories = {}
         history_rows = []
         agent_disc_returns = {}
+        # Discounted scalarized return per position — returned to the caller so
+        # the heuristic bookkeeping (scalar_history) uses the SAME seeded
+        # eval_rep-episode evaluation that feeds history.csv and the archive
+        # (review 2026-07-03; previously a separate unseeded 3-episode eval).
+        agent_scalars = {}
         # NOTE: agent.id is seed-based (seed + position, see _create_new_agent);
         # task bookkeeping (active_tasks, timesteps_trained, history.csv) is
         # positional — always key by the enumerate position here.
@@ -327,8 +377,12 @@ class MOSAC(Agent):
             scalarized_return, scalarized_discounted_return, vec_return, disc_vec_return, episode_evals = (
                 evaluate_single_weight(agent, env=eval_env, w=agent.weights.cpu().numpy(), rep=eval_rep,
                                        seed=eval_seed, eval_gamma=eval_gamma, return_episodes=True))
-            # Individual eval-episode returns (undiscounted scalarized) — G2.
-            episode_scalars = [float(e[0]) for e in episode_evals]
+            # Individual eval-episode returns (DISCOUNTED scalarized, e[1]) — G2.
+            # Discounted to match PPO's logging semantics (review 2026-07-03:
+            # PPO logs discounted returns; mixing conventions across algos
+            # would break the pooled analysis of scalar/r_*/eval_scalars).
+            episode_scalars = [float(e[1]) for e in episode_evals]
+            agent_scalars[pos] = float(scalarized_discounted_return)
             self._eval_returns_histories.setdefault(pos, []).append(episode_scalars)
             agent_disc_returns[pos] = disc_vec_return
             if log_verbose > 0:
@@ -340,16 +394,18 @@ class MOSAC(Agent):
                     writer.add_scalar(f'return/vec_discounted_return_{j}/agent_{agent.id}', d_val, self.global_step)
             self.archive.add(copy.deepcopy(agent), disc_vec_return)
 
+            # Objective columns log the DISCOUNTED vector return — same
+            # semantics as PPO's rows (see note above).
             r_time = -200.0
             r_ener_f = -200.0
             r_ener_b = -200.0
             if self.reward_dim == 2:
-                r_ener_f = vec_return[0]
-                r_ener_b = vec_return[1]
+                r_ener_f = disc_vec_return[0]
+                r_ener_b = disc_vec_return[1]
             elif self.reward_dim == 3:
-                r_time = vec_return[0]
-                r_ener_f = vec_return[1]
-                r_ener_b = vec_return[2]
+                r_time = disc_vec_return[0]
+                r_ener_f = disc_vec_return[1]
+                r_ener_b = disc_vec_return[2]
 
             import time as time_mod
             elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
@@ -359,7 +415,7 @@ class MOSAC(Agent):
             params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
                       f"{rp.get('total_timesteps', '')},{rp.get('eval_timesteps', '')},"
                       f"{rp.get('warmup', 0)},{rp.get('warmup_steps', 0)},{rp.get('host', '')}")
-            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars},{params}\n")
+            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_discounted_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars},{params}\n")
 
         # Dominance rank of every agent vs. the fully updated archive (G3).
         if _EXT_SIGNALS:
@@ -369,17 +425,17 @@ class MOSAC(Agent):
 
         if pf_store is not None:
             history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv")
-            file_exists = os.path.isfile(history_file)
-            with open(history_file, "a", encoding="utf-8") as f:
-                if not file_exists:
-                    f.write("seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n")
-                for row in history_rows:
-                    f.write(row)
+            _locked_history_append(
+                history_file,
+                "seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n",
+                history_rows)
 
         if writer is not None:
             import time as time_mod
             elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
             writer.add_scalar('eval/training_time', elapsed, self.global_step)
+
+        return agent_scalars
 
         front = self.archive.evaluations
         hv = log_metrics(front, ref_point=ref_point, known_pareto_front=known_pareto_front,
@@ -594,7 +650,7 @@ class MOSAC(Agent):
             'host': platform.node(),
         }
 
-        self._eval_all_agents(
+        init_scalars = self._eval_all_agents(
             self.agents,
             eval_env=eval_env,
             ref_point=ref_point,
@@ -611,14 +667,18 @@ class MOSAC(Agent):
 
         self.timesteps_trained = [0] * len(self.agents)
         active_tasks = [{'id': idx, 'agent': agent, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'weight': agent.weights} for idx, agent in enumerate(self.agents)]
-        
+
+        # Seed scalar_history from the SAME seeded, eval_rep-episode, discounted
+        # evaluation that feeds history.csv and the archive — single source of
+        # truth like in PPO (review 2026-07-03; previously a separate unseeded
+        # 3-episode undiscounted eval made heuristic decisions diverge from logs).
         for t in active_tasks:
-            s = self._evaluate_agent(t['agent'], eval_env, t['weight'])
-            t['scalar_history'].append(s)
+            t['scalar_history'].append(init_scalars[t['id']])
 
         while self.global_step < total_timesteps:
             steps_this_interval = min(eval_timesteps, total_timesteps - self.global_step)
 
+            chosen = None
             if heuristic is not None and heuristic.__class__.__name__ != 'RoundRobinHeuristic':
                 active_list = [t for t in active_tasks if t['active']]
                 if not active_list: break
@@ -627,9 +687,17 @@ class MOSAC(Agent):
                 # heuristic (positional indexing) — full-k arrays shift every
                 # index once a task was eliminated (IndexError / wrong task).
                 signals = self._compute_signals(active_list)
+                # Never let a single deactivation sweep empty the pool: the
+                # in-heuristic "last task" guards check the round-START length,
+                # so simultaneous eliminations could kill every task at once
+                # and silently end the run early (review 2026-07-03).
+                remaining = len(active_list)
                 for i, t in enumerate(active_list):
+                    if remaining <= 1:
+                        break
                     if heuristic.should_deactivate(t, i, signals):
                         t['active'] = False
+                        remaining -= 1
                         print(f"--- Task {t['id']} ELIMINATED at {self.global_step} steps ---")
 
                 active_list = [t for t in active_tasks if t['active']]
@@ -638,18 +706,13 @@ class MOSAC(Agent):
                 signals = self._compute_signals(active_list)
                 chosen_idx = heuristic.select_next_task(active_list, signals)
                 chosen = active_list[chosen_idx]
-                
+
                 print(f"Allocating {steps_this_interval} steps to Task {chosen['id']}")
                 self._train_single_agent(chosen['id'], steps_this_interval)
-                
-                s = self._evaluate_agent(chosen['agent'], eval_env, chosen['weight'])
-                prev_s = chosen['scalar_history'][-1]
-                chosen['stagnation_count'] = 0 if s > prev_s + 0.5 else chosen['stagnation_count'] + 1
-                chosen['scalar_history'].append(s)
             else:
                 self._train_all_agents(timesteps=steps_this_interval)
 
-            self._eval_all_agents(
+            round_scalars = self._eval_all_agents(
                 self.agents,
                 eval_env=eval_env,
                 ref_point=ref_point,
@@ -663,6 +726,14 @@ class MOSAC(Agent):
                 known_pareto_front=known_pareto_front,
                 log_verbose=log_verbose
             )
+
+            # Heuristic bookkeeping from the SAME evaluation that produced the
+            # history rows / archive update of this round (PPO pattern).
+            if chosen is not None:
+                s = round_scalars[chosen['id']]
+                prev_s = chosen['scalar_history'][-1]
+                chosen['stagnation_count'] = 0 if s > prev_s + 0.5 else chosen['stagnation_count'] + 1
+                chosen['scalar_history'].append(s)
 
         self.env.close()
         eval_env.close()
