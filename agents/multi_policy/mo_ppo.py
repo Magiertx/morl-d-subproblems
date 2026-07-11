@@ -46,12 +46,13 @@ def _available_cpus():
 
 
 def _locked_history_append(history_file: str, header: str, rows: list) -> None:
-    """Append rows to the shared history.csv under an exclusive lock file.
+    """Append rows to a per-heuristic history CSV under an exclusive lock file.
 
-    All heuristic runs of one (env, algo, k, seed) share a single history.csv;
-    on the SLURM cluster several of them may run concurrently, so both the
-    header existence check and the append must be serialized (otherwise:
-    duplicated headers mid-file / interleaved partial rows — review 2026-07-03).
+    Seit 2026-07-11 schreibt jede Heuristik ihre eigene history_<Label>.csv;
+    der Lock schuetzt nur noch gegen doppelte Schreiber desselben Laufs
+    (SLURM-Requeue), nicht mehr gegen andere Heuristiken. Der Header-Check und
+    der Append bleiben serialisiert (otherwise: duplicated headers mid-file /
+    interleaved partial rows — review 2026-07-03).
     Lock: O_CREAT|O_EXCL lock file (portable across Windows, Linux and NFS);
     stale locks older than 60s are stolen, after 120s we write unlocked as a
     last resort (losing lock safety beats losing the run's results).
@@ -474,10 +475,15 @@ class MOPPO(Agent):
         def _log_history(spent_budget):
             import os
             elapsed = time_mod.perf_counter() - start_time
-            history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv") if pf_store else None
-            if not history_file:
+            if not pf_store:
                 return
             h_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
+            # Eine history-Datei PRO HEURISTIK (Review 2026-07-11): parallele
+            # Laeufe desselben (env, algo, k, seed) schreiben nie mehr in
+            # dieselbe Datei — die NFS-Race-Frage entfaellt, der Merge passiert
+            # beim Auswerten. Lock bleibt als Schutz gegen SLURM-Requeues.
+            history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)),
+                                        f"history_{h_name.replace(':', '-')}.csv")
             # Run parameters mirrored into every row so runs with different
             # settings stay distinguishable in the pooled results.
             import platform
@@ -508,10 +514,11 @@ class MOPPO(Agent):
                 scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
                 # Latest individual eval-episode returns (';'-joined, CSV-safe) — G2 logging.
                 eval_scalars = ";".join(f"{v:.4f}" for v in task['eval_returns_history'][-1]) if task.get('eval_returns_history') else ""
-                rows.append(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars},{run_params}\n")
+                dom_rank = task['dominance_history'][-1] if task.get('dominance_history') else 0.0
+                rows.append(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars},{dom_rank},{run_params}\n")
             _locked_history_append(
                 history_file,
-                "seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n",
+                "seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,dominance_rank,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n",
                 rows)
             if writer:
                 writer.add_scalar("eval/training_time", elapsed, global_step=spent_budget)

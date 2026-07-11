@@ -31,12 +31,13 @@ except ImportError:
 
 
 def _locked_history_append(history_file: str, header: str, rows: list) -> None:
-    """Append rows to the shared history.csv under an exclusive lock file.
+    """Append rows to a per-heuristic history CSV under an exclusive lock file.
 
-    All heuristic runs of one (env, algo, k, seed) share a single history.csv;
-    on the SLURM cluster several of them may run concurrently, so both the
-    header existence check and the append must be serialized (otherwise:
-    duplicated headers mid-file / interleaved partial rows — review 2026-07-03).
+    Seit 2026-07-11 schreibt jede Heuristik ihre eigene history_<Label>.csv;
+    der Lock schuetzt nur noch gegen doppelte Schreiber desselben Laufs
+    (SLURM-Requeue), nicht mehr gegen andere Heuristiken. Der Header-Check und
+    der Append bleiben serialisiert (otherwise: duplicated headers mid-file /
+    interleaved partial rows — review 2026-07-03).
     Lock: O_CREAT|O_EXCL lock file (portable across Windows, Linux and NFS);
     stale locks older than 60s are stolen, after 120s we write unlocked as a
     last resort (losing lock safety beats losing the run's results).
@@ -364,6 +365,10 @@ class MOSAC(Agent):
             self._eval_returns_histories = {}
             self._dominance_histories = {}
         history_rows = []
+        # Per-Position gesammelte Roh-Felder; die fertige Zeile wird erst NACH
+        # dem Dominanz-Append gebaut, damit dominance_rank den frischen
+        # Checkpoint traegt (Review 2026-07-11) statt einen Schritt alt zu sein.
+        row_fields = {}
         agent_disc_returns = {}
         # Discounted scalarized return per position — returned to the caller so
         # the heuristic bookkeeping (scalar_history) uses the SAME seeded
@@ -415,7 +420,10 @@ class MOSAC(Agent):
             params = (f"{self.env_id},{self.reward_dim},{self.num_subproblems},"
                       f"{rp.get('total_timesteps', '')},{rp.get('eval_timesteps', '')},"
                       f"{rp.get('warmup', 0)},{rp.get('warmup_steps', 0)},{rp.get('host', '')}")
-            history_rows.append(f"{self.seed},{h_name},OFF,{self.global_step},{pos},{scalarized_discounted_return},{r_time},{r_ener_f},{r_ener_b},{t_trained},{elapsed:.2f},{eval_scalars},{params}\n")
+            row_fields[pos] = (
+                f"{self.seed},{h_name},OFF,{self.global_step},{pos},"
+                f"{scalarized_discounted_return},{r_time},{r_ener_f},{r_ener_b},"
+                f"{t_trained},{elapsed:.2f},{eval_scalars}", params)
 
         # Dominance rank of every agent vs. the fully updated archive (G3).
         if _EXT_SIGNALS:
@@ -423,11 +431,20 @@ class MOSAC(Agent):
                 self._dominance_histories.setdefault(pos, []).append(
                     dominance_rank(agent_disc_returns[pos], self.archive.evaluations))
 
+        # Zeilen erst jetzt bauen: dominance_rank aus dem soeben aktualisierten
+        # _dominance_histories, damit die Provenienz-Spalte zum Checkpoint passt.
+        for pos in range(len(agents)):
+            head, params = row_fields[pos]
+            dom_rank = (self._dominance_histories.get(pos, [0.0])[-1]
+                        if hasattr(self, '_dominance_histories') else 0.0)
+            history_rows.append(f"{head},{dom_rank},{params}\n")
+
         if pf_store is not None:
-            history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)), "history.csv")
+            history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)),
+                                        f"history_{h_name.replace(':', '-')}.csv")
             _locked_history_append(
                 history_file,
-                "seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n",
+                "seed,heuristic,algo,spent_budget,task_id,scalar,r_time,r_ener_f,r_ener_b,timesteps_trained,training_time,eval_scalars,dominance_rank,env_id,num_obj,k,total_timesteps,eval_timesteps,warmup,warmup_steps,host\n",
                 history_rows)
 
         if writer is not None:
