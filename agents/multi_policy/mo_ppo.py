@@ -457,8 +457,13 @@ class MOPPO(Agent):
         all_samples = list(self.initial_samples)
 
         # Per-subproblem state used by the heuristic. Indexed by sample_id.
+        # scalar_history startet LEER (Review 2026-07-11 Punkt 1b): der alte
+        # -1000.0-Platzhalter machte die erste echte Rate zu einem +1000-Artefakt
+        # und vergiftete jedes darauf aufbauende Signal. SAC seedet mit dem
+        # echten Initial-Skalar (hat eine Initial-Evaluation); PPO hat keine,
+        # also bleiben Raten undefiniert (=0), bis zwei echte Punkte vorliegen.
         active_tasks = [
-            {'id': idx, 'scalar_history': [-1000.0], 'stagnation_count': 0, 'active': True, 'timesteps_trained': 0,
+            {'id': idx, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'timesteps_trained': 0,
              'eval_returns_history': [], 'dominance_history': []}
             for idx in range(len(self.initial_samples))
         ]
@@ -605,8 +610,8 @@ class MOPPO(Agent):
                     scalar_val = float(np.dot(latest.objs, latest.weights))
                     task = active_tasks[real_id]
                     task['timesteps_trained'] += this_update * steps_per_task_iteration
-                    prev_s = task['scalar_history'][-1]
-                    task['stagnation_count'] = 0 if scalar_val > prev_s + 0.5 else task['stagnation_count'] + 1
+                    prev_s = task['scalar_history'][-1] if task['scalar_history'] else None
+                    task['stagnation_count'] = 0 if (prev_s is None or scalar_val > prev_s + 0.5) else task['stagnation_count'] + 1
                     task['scalar_history'].append(scalar_val)
 
                     # Individual eval-episode returns, scalarized on the task
