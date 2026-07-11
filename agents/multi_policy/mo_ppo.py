@@ -30,8 +30,8 @@ from agents.single_policy.ppo.external_pareto import ExternalPareto
 # (train_mo_ppo.py adds the root to sys.path). Keep the framework usable
 # standalone by degrading gracefully to the base signal set.
 try:
-    from heuristics.signals import (norm_rolling_improvement, probability_of_improvement,
-                                    dominance_rank, dominance_improvement)
+    from heuristics.signals import (probability_of_improvement,
+                                    dominance_rank, improvement_per_step)
     _EXT_SIGNALS = True
 except ImportError:
     _EXT_SIGNALS = False
@@ -375,32 +375,31 @@ class MOPPO(Agent):
         print(f'[INFO] MO-PPO configuration saved')
 
     def _compute_signals(self, active_tasks: list) -> dict:
-        """Performance signals consumed by dynamic budget-allocation heuristics."""
-        scalars = [t['scalar_history'][-1] if t['scalar_history'] else -200 for t in active_tasks]
-        gaps = [max(scalars + [-200]) - s for s in scalars]
-        signals = {
-            'scalar_rewards': scalars,
-            'performance_gaps': gaps,
-            'improvement_rates': [
-                (t['scalar_history'][-1] - t['scalar_history'][-2]) if len(t['scalar_history']) >= 2 else 0.0
-                for t in active_tasks
-            ],
-            'stagnation_counts': [t['stagnation_count'] for t in active_tasks],
+        """Performance signals consumed by dynamic budget-allocation heuristics.
+
+        Bereinigtes Set (Review 2026-07-11): prob_improvements (Rate),
+        dominance_ranks (Position, normierter Anteil), improvement_per_step
+        (Roh-Kontrolle). scalar_histories + spent_budget sind interne
+        Zutaten (MLFQ-Demotion, Early-Stopping, Boost-Takt).
+        """
+        if not _EXT_SIGNALS:
+            raise RuntimeError(
+                'heuristics/signals.py not importable — dynamic heuristics '
+                'require launching through the entry scripts (train_mo_*.py).')
+        return {
             'scalar_histories': [list(t['scalar_history']) for t in active_tasks],
-        }
-        if _EXT_SIGNALS:
-            signals['norm_improvement_rates'] = [
-                norm_rolling_improvement(t['scalar_history']) for t in active_tasks]
-            signals['prob_improvements'] = [
+            'spent_budget': int(getattr(self, '_spent_budget', 0)),
+            'prob_improvements': [
                 probability_of_improvement(t['eval_returns_history'][-2], t['eval_returns_history'][-1])
                 if len(t.get('eval_returns_history', [])) >= 2 else 0.5
-                for t in active_tasks]
-            signals['dominance_ranks'] = [
-                t['dominance_history'][-1] if t.get('dominance_history') else 0
-                for t in active_tasks]
-            signals['dominance_improvements'] = [
-                dominance_improvement(t.get('dominance_history', [])) for t in active_tasks]
-        return signals
+                for t in active_tasks],
+            'dominance_ranks': [
+                t['dominance_history'][-1] if t.get('dominance_history') else 0.0
+                for t in active_tasks],
+            'improvement_per_step': [
+                improvement_per_step(t['scalar_history'], t['timesteps_history'])
+                for t in active_tasks],
+        }
 
     def train(
             self,
@@ -431,10 +430,11 @@ class MOPPO(Agent):
         current_timestep = 0
         next_eval_timestep = eval_timesteps
 
-        # Treat RoundRobin (or no heuristic) as "all active tasks in parallel".
-        # Any other dynamic heuristic picks a single task per round.
-        is_round_robin = (heuristic is None
-                          or heuristic.__class__.__name__ == 'RoundRobinHeuristic')
+        # Heuristiken mit parallel_backbone (RoundRobin, RoundRobin+Early-
+        # Stopping) trainieren alle aktiven Tasks pro Runde; alle anderen
+        # selektieren eine Aufgabe pro Runde.
+        is_parallel = (heuristic is None
+                       or getattr(heuristic, 'parallel_backbone', False))
 
         # Pool size: as many workers as fit on the CPU allocation, capped at k.
         # Each worker uses DummyVecEnv (single-threaded), so 1 CPU per worker.
@@ -463,8 +463,8 @@ class MOPPO(Agent):
         # echten Initial-Skalar (hat eine Initial-Evaluation); PPO hat keine,
         # also bleiben Raten undefiniert (=0), bis zwei echte Punkte vorliegen.
         active_tasks = [
-            {'id': idx, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'timesteps_trained': 0,
-             'eval_returns_history': [], 'dominance_history': []}
+            {'id': idx, 'scalar_history': [], 'active': True, 'timesteps_trained': 0,
+             'timesteps_history': [], 'eval_returns_history': [], 'dominance_history': []}
             for idx in range(len(self.initial_samples))
         ]
 
@@ -522,36 +522,16 @@ class MOPPO(Agent):
         with Pool(processes=pool_size) as pool:
 
             while current_timestep < total_timesteps:
-                # Per-round cost depends on whether we run all active tasks or just one.
-                if is_round_robin:
-                    num_active = sum(1 for t in active_tasks if t['active'])
-                    if num_active == 0:
-                        break
-                    timesteps_per_round = num_active * steps_per_task_iteration
-                else:
-                    timesteps_per_round = steps_per_task_iteration
-
-                timesteps_to_next_eval = next_eval_timestep - current_timestep
-                iters_to_next_eval = max(1, timesteps_to_next_eval // timesteps_per_round)
-                max_iters_remaining = (total_timesteps - current_timestep) // timesteps_per_round
-                this_update = min(iters_to_next_eval, max_iters_remaining)
-                if this_update < 1:
+                # ── Deaktivierung (alle Heuristiken mit should_deactivate) ───
+                active_list = [t for t in active_tasks if t['active']]
+                if not active_list:
                     break
-
-                end_iteration = current_iteration + this_update
-
-                # ── Heuristic-driven task selection ──────────────────────────
-                if is_round_robin:
-                    selected_ids = [i for i, t in enumerate(active_tasks) if t['active']]
-                else:
-                    active_list = [t for t in active_tasks if t['active']]
-                    if not active_list:
-                        break
-
-                    # Signals MUST be computed over exactly the list handed to the
-                    # heuristic: all heuristics index them positionally, so a
-                    # full-k array vs. filtered active_list shifts every index
-                    # after the first elimination (IndexError / wrong task).
+                if heuristic is not None:
+                    self._spent_budget = current_timestep
+                    # Signals MUST be computed over exactly the list handed to
+                    # the heuristic: all heuristics index them positionally, so
+                    # a full-k array vs. filtered active_list shifts every
+                    # index after the first elimination (IndexError / wrong task).
                     signals = self._compute_signals(active_list)
                     # Never let a single deactivation sweep empty the pool: the
                     # in-heuristic "last task" guards check the round-START
@@ -565,11 +545,30 @@ class MOPPO(Agent):
                             t['active'] = False
                             remaining -= 1
                             print(f"--- Task {t['id']} ELIMINATED at {current_timestep} steps ---")
-
                     active_list = [t for t in active_tasks if t['active']]
                     if not active_list:
                         break
 
+                # ── Rundenbudget (nach dem Sweep: num_active ist frisch) ─────
+                if is_parallel:
+                    num_active = len(active_list)
+                    timesteps_per_round = num_active * steps_per_task_iteration
+                else:
+                    timesteps_per_round = steps_per_task_iteration
+
+                timesteps_to_next_eval = next_eval_timestep - current_timestep
+                iters_to_next_eval = max(1, timesteps_to_next_eval // timesteps_per_round)
+                max_iters_remaining = (total_timesteps - current_timestep) // timesteps_per_round
+                this_update = min(iters_to_next_eval, max_iters_remaining)
+                if this_update < 1:
+                    break
+
+                end_iteration = current_iteration + this_update
+
+                # ── Task selection ───────────────────────────────────────────
+                if is_parallel:
+                    selected_ids = [t['id'] for t in active_list]
+                else:
                     signals = self._compute_signals(active_list)
                     chosen_idx = heuristic.select_next_task(active_list, signals)
                     chosen_real_id = active_list[chosen_idx]['id']
@@ -610,9 +609,8 @@ class MOPPO(Agent):
                     scalar_val = float(np.dot(latest.objs, latest.weights))
                     task = active_tasks[real_id]
                     task['timesteps_trained'] += this_update * steps_per_task_iteration
-                    prev_s = task['scalar_history'][-1] if task['scalar_history'] else None
-                    task['stagnation_count'] = 0 if (prev_s is None or scalar_val > prev_s + 0.5) else task['stagnation_count'] + 1
                     task['scalar_history'].append(scalar_val)
+                    task['timesteps_history'].append(task['timesteps_trained'])
 
                     # Individual eval-episode returns, scalarized on the task
                     # weight — feeds probability of improvement (G2).

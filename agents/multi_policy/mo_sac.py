@@ -23,8 +23,8 @@ from misc.weights import generate_das_dennis_weights, generate_layer_energy_weig
 # (train_mo_sac.py adds the root to sys.path). Keep the framework usable
 # standalone by degrading gracefully to the base signal set.
 try:
-    from heuristics.signals import (norm_rolling_improvement, probability_of_improvement,
-                                    dominance_rank, dominance_improvement)
+    from heuristics.signals import (probability_of_improvement,
+                                    dominance_rank, improvement_per_step)
     _EXT_SIGNALS = True
 except ImportError:
     _EXT_SIGNALS = False
@@ -447,19 +447,24 @@ class MOSAC(Agent):
 
         return agent_scalars
 
-    def _train_all_agents(self,
-                          timesteps: int):
+    def _train_all_agents(self, timesteps: int, agent_ids=None):
+        # agent_ids: aktive Teilmenge (RoundRobin+EarlyStopping); None = alle.
+        # Deaktivierte Agents sammeln nicht mehr UND updaten nicht mehr —
+        # ihr Compute ist wirklich frei. Der Cursor rotiert modulo der
+        # aktiven Anzahl; beim Schrumpfen kann die Rotation einmalig
+        # springen (gleiches akzeptiertes Verhalten wie der MLFQ-Cursor).
+        ids = list(agent_ids) if agent_ids is not None else list(range(len(self.agents)))
         remaining = timesteps
-        n_agents = len(self.agents)
+        n_agents = len(ids)
         while remaining > 0:
             step_count = min(n_agents, remaining)
             for offset in range(step_count):
-                agent_idx = (self._agent_rr_idx + offset) % n_agents
-                self.agents[agent_idx].collect_sample(self.replay_buffer)
+                pos = ids[(self._agent_rr_idx + offset) % n_agents]
+                self.agents[pos].collect_sample(self.replay_buffer)
                 self.global_step += 1
                 remaining -= 1
                 if hasattr(self, 'timesteps_trained'):
-                    self.timesteps_trained[agent_idx] += 1
+                    self.timesteps_trained[pos] += 1
             self._agent_rr_idx = (self._agent_rr_idx + step_count) % n_agents
 
             if self.replay_buffer.size < self.batch_size:
@@ -467,8 +472,8 @@ class MOSAC(Agent):
 
             for _ in range(self.gradient_updates):
                 batch = self.replay_buffer.sample(self.batch_size, to_tensor=True, device=self.device)
-                for ag in self.agents:
-                    ag.update(batch)
+                for pos in ids:
+                    self.agents[pos].update(batch)
 
     def _train_single_agent(self, agent_idx: int, timesteps: int):
         """
@@ -520,38 +525,32 @@ class MOSAC(Agent):
         return float(np.dot(np.mean(all_rewards, axis=0), w_np))
 
     def _compute_signals(self, active_tasks: list) -> dict:
+        """Performance signals consumed by dynamic budget-allocation heuristics.
+
+        Bereinigtes Set (Review 2026-07-11): prob_improvements (Rate),
+        dominance_ranks (Position, normierter Anteil), improvement_per_step
+        (Roh-Kontrolle). scalar_histories + spent_budget sind interne
+        Zutaten (MLFQ-Demotion, Early-Stopping, Boost-Takt).
         """
-        Compute performance signals used by budget allocation heuristics.
-        
-        Args:
-            active_tasks (list): List of currently active task dictionaries.
-            
-        Returns:
-            dict: Dictionary containing historical and current performance metrics.
-        """
-        scalars = [t['scalar_history'][-1] if t['scalar_history'] else -200 for t in active_tasks]
-        gaps = [max(scalars + [-200]) - s for s in scalars]
-        signals = {
-            'scalar_rewards': scalars,
-            'performance_gaps': gaps,
-            'improvement_rates': [(t['scalar_history'][-1] - t['scalar_history'][-2]) if len(t['scalar_history']) >= 2 else 0.0 for t in active_tasks],
-            'stagnation_counts': [t['stagnation_count'] for t in active_tasks],
-            'scalar_histories': [list(t['scalar_history']) for t in active_tasks]
-        }
-        if _EXT_SIGNALS:
-            err = getattr(self, '_eval_returns_histories', {})
-            dom = getattr(self, '_dominance_histories', {})
-            signals['norm_improvement_rates'] = [
-                norm_rolling_improvement(t['scalar_history']) for t in active_tasks]
-            signals['prob_improvements'] = [
+        if not _EXT_SIGNALS:
+            raise RuntimeError(
+                'heuristics/signals.py not importable — dynamic heuristics '
+                'require launching through the entry scripts (train_mo_*.py).')
+        err = getattr(self, '_eval_returns_histories', {})
+        dom = getattr(self, '_dominance_histories', {})
+        return {
+            'scalar_histories': [list(t['scalar_history']) for t in active_tasks],
+            'spent_budget': int(self.global_step),
+            'prob_improvements': [
                 probability_of_improvement(err[t['id']][-2], err[t['id']][-1])
                 if len(err.get(t['id'], [])) >= 2 else 0.5
-                for t in active_tasks]
-            signals['dominance_ranks'] = [
-                dom[t['id']][-1] if dom.get(t['id']) else 0 for t in active_tasks]
-            signals['dominance_improvements'] = [
-                dominance_improvement(dom.get(t['id'], [])) for t in active_tasks]
-        return signals
+                for t in active_tasks],
+            'dominance_ranks': [
+                dom[t['id']][-1] if dom.get(t['id']) else 0.0 for t in active_tasks],
+            'improvement_per_step': [
+                improvement_per_step(t['scalar_history'], t['timesteps_history'])
+                for t in active_tasks],
+        }
 
     def train(
             self,
@@ -669,31 +668,34 @@ class MOSAC(Agent):
         )
 
         self.timesteps_trained = [0] * len(self.agents)
-        active_tasks = [{'id': idx, 'agent': agent, 'scalar_history': [], 'stagnation_count': 0, 'active': True, 'weight': agent.weights} for idx, agent in enumerate(self.agents)]
+        active_tasks = [{'id': idx, 'agent': agent, 'scalar_history': [], 'timesteps_history': [],
+                         'active': True, 'weight': agent.weights} for idx, agent in enumerate(self.agents)]
 
         # Seed scalar_history from the SAME seeded, eval_rep-episode, discounted
         # evaluation that feeds history.csv and the archive — single source of
-        # truth like in PPO (review 2026-07-03; previously a separate unseeded
-        # 3-episode undiscounted eval made heuristic decisions diverge from logs).
+        # truth like in PPO (review 2026-07-03). PPO selbst hat KEINE Initial-
+        # Evaluation und startet leer (Review 2026-07-11 Punkt 1b).
         for t in active_tasks:
             t['scalar_history'].append(init_scalars[t['id']])
+            t['timesteps_history'].append(0)
 
         while self.global_step < total_timesteps:
             steps_this_interval = min(eval_timesteps, total_timesteps - self.global_step)
 
             chosen = None
-            if heuristic is not None and heuristic.__class__.__name__ != 'RoundRobinHeuristic':
-                active_list = [t for t in active_tasks if t['active']]
-                if not active_list: break
+            is_parallel = (heuristic is None
+                           or getattr(heuristic, 'parallel_backbone', False))
+            active_list = [t for t in active_tasks if t['active']]
+            if not active_list:
+                break
 
+            if heuristic is not None:
                 # Signals MUST be computed over exactly the list handed to the
                 # heuristic (positional indexing) — full-k arrays shift every
                 # index once a task was eliminated (IndexError / wrong task).
                 signals = self._compute_signals(active_list)
-                # Never let a single deactivation sweep empty the pool: the
-                # in-heuristic "last task" guards check the round-START length,
-                # so simultaneous eliminations could kill every task at once
-                # and silently end the run early (review 2026-07-03).
+                # Never let a single deactivation sweep empty the pool
+                # (review 2026-07-03).
                 remaining = len(active_list)
                 for i, t in enumerate(active_list):
                     if remaining <= 1:
@@ -702,18 +704,19 @@ class MOSAC(Agent):
                         t['active'] = False
                         remaining -= 1
                         print(f"--- Task {t['id']} ELIMINATED at {self.global_step} steps ---")
-
                 active_list = [t for t in active_tasks if t['active']]
-                if not active_list: break
+                if not active_list:
+                    break
 
+            if is_parallel:
+                self._train_all_agents(timesteps=steps_this_interval,
+                                       agent_ids=[t['id'] for t in active_list])
+            else:
                 signals = self._compute_signals(active_list)
                 chosen_idx = heuristic.select_next_task(active_list, signals)
                 chosen = active_list[chosen_idx]
-
                 print(f"Allocating {steps_this_interval} steps to Task {chosen['id']}")
                 self._train_single_agent(chosen['id'], steps_this_interval)
-            else:
-                self._train_all_agents(timesteps=steps_this_interval)
 
             round_scalars = self._eval_all_agents(
                 self.agents,
@@ -731,12 +734,14 @@ class MOSAC(Agent):
             )
 
             # Heuristic bookkeeping from the SAME evaluation that produced the
-            # history rows / archive update of this round (PPO pattern).
-            if chosen is not None:
-                s = round_scalars[chosen['id']]
-                prev_s = chosen['scalar_history'][-1]
-                chosen['stagnation_count'] = 0 if s > prev_s + 0.5 else chosen['stagnation_count'] + 1
-                chosen['scalar_history'].append(s)
+            # history rows / archive update of this round (PPO pattern). Im
+            # Parallelpfad (RoundRobin+EarlyStopping) schreiben ALLE aktiven
+            # Tasks ihre Historien fort, damit die Konvergenzpruefung pro
+            # Aufgabe frische Checkpoints sieht.
+            book_tasks = [t for t in active_tasks if t['active']] if chosen is None else [chosen]
+            for t in book_tasks:
+                t['scalar_history'].append(round_scalars[t['id']])
+                t['timesteps_history'].append(self.timesteps_trained[t['id']])
 
             elapsed_min = (time_mod.perf_counter() - self.start_time) / 60.0
             pct = 100.0 * self.global_step / total_timesteps

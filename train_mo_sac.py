@@ -7,8 +7,7 @@ from heuristics.dynamic_heuristics import (
     RankBasedHeuristic,
     BanditHeuristic,
     RottingBanditHeuristic,
-    EliminationHeuristic,
-    StagnationBasedHeuristic,
+    RoundRobinEarlyStoppingHeuristic,
     MLFQHeuristic,
     MarginalValueHeuristic,
     ProportionalShareHeuristic,
@@ -46,9 +45,9 @@ def main():
                              '(SAC is step-based, any value works; supervisor target range 1k-5k).')
     parser.add_argument('--heuristic', type=str, default='round-robin',
                         help='Budget allocation heuristic, optionally with a signal variant '
-                             '"<name>:<signal_key>" (B2), e.g. "bandit:norm_improvement_rates". '
+                             '"<name>:<signal_key>" (B2), e.g. "bandit:prob_improvements". '
                              'Names: round-robin, random, rank-based, bandit, rotting-bandit, '
-                             'elimination, stagnation-based, mlfq, marginal-value, '
+                             'rr-early-stopping, mlfq, marginal-value, '
                              'proportional-share, cmu-rule. '
                              f'Signal keys: {", ".join(SELECTABLE_SIGNAL_KEYS)}.')
 
@@ -60,15 +59,16 @@ def main():
         'rank-based': (RankBasedHeuristic, {}),
         'bandit': (BanditHeuristic, {'exploration_constant': 1.0}),
         'rotting-bandit': (RottingBanditHeuristic, {}),
-        'elimination': (EliminationHeuristic, {'window_size': 5}),
-        'stagnation-based': (StagnationBasedHeuristic, {}),
+        'rr-early-stopping': (RoundRobinEarlyStoppingHeuristic, {}),
         'mlfq': (MLFQHeuristic, {}),
         'marginal-value': (MarginalValueHeuristic, {}),
         'proportional-share': (ProportionalShareHeuristic, {}),
         'cmu-rule': (CMuRuleHeuristic, {}),
     }
     # Heuristics whose identity IS their signal — no ":<signal_key>" variant.
-    fixed_signal = ('round-robin', 'random', 'stagnation-based', 'mlfq')
+    # cmu-rule laeuft fix mit c=dominance_ranks, mu=prob_improvements
+    # (einzige Multi-Signal-Heuristik, Review 2026-07-11).
+    fixed_signal = ('round-robin', 'random', 'mlfq', 'cmu-rule')
 
     h_name, _, h_signal = args.heuristic.partition(':')
     if h_name not in heuristic_map:
@@ -77,10 +77,7 @@ def main():
     if h_signal:
         if h_name in fixed_signal:
             parser.error(f"Heuristic '{h_name}' does not support a signal variant.")
-        # cmu-rule: the variant selects the efficiency term mu; the urgency
-        # term c stays at its default (constructor arg c_signal_key).
-        signal_kwarg = 'mu_signal_key' if h_name == 'cmu-rule' else 'signal_key'
-        h_kwargs = {**h_kwargs, signal_kwarg: h_signal}
+        h_kwargs = {**h_kwargs, 'signal_key': h_signal}
     heuristic_obj = h_cls(**h_kwargs)
     # Label lands in the history.csv 'heuristic' column so signal variants
     # stay distinguishable in the analysis (read by the orchestrator).
