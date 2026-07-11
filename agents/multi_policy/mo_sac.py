@@ -435,14 +435,17 @@ class MOSAC(Agent):
             elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
             writer.add_scalar('eval/training_time', elapsed, self.global_step)
 
-        return agent_scalars
-
+        # HV + Front-Speicherung VOR dem return (Review Betreuerin 2026-07-11,
+        # Punkt 1a: der Block stand hinter dem return und war toter Code —
+        # SAC loggte kein Hypervolume und speicherte keine Fronten).
         front = self.archive.evaluations
         hv = log_metrics(front, ref_point=ref_point, known_pareto_front=known_pareto_front,
                          reward_dim=self.reward_dim, num_sample_weights=num_sample_weights,
                          global_step=self.global_step, writer=writer, log=self.log,
                          save_fronts=save_front, pf_store=pf_store)
         print(f'Hypervolume @ step {self.global_step}: {round(hv, 2)}')
+
+        return agent_scalars
 
     def _train_all_agents(self,
                           timesteps: int):
