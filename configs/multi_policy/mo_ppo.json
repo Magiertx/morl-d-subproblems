@@ -1,7 +1,7 @@
 {
   "num_processes": 8,
   "num_steps": 512,
-  "gamma": 0.995,
+  "gamma": 0.99,
   "net_arch": [
     64,
     64
@@ -11,7 +11,7 @@
   "clip_param": 0.2,
   "ppo_epoch": 10,
   "num_mini_batches": 32,
-  "entropy_coef": 0.0,
+  "entropy_coef": 0.05,
   "value_loss_coef": 0.5,
   "max_grad_norm": 0.5,
   "use_clipped_value_loss": true,
