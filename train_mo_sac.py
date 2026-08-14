@@ -12,6 +12,9 @@ from heuristics.dynamic_heuristics import (
     MarginalValueHeuristic,
     ProportionalShareHeuristic,
     CMuRuleHeuristic,
+    SuccessiveHalvingHeuristic,
+    FixedOrderHeuristic,
+    FixedShareHeuristic,
     SELECTABLE_SIGNAL_KEYS,
 )
 
@@ -23,6 +26,30 @@ import mo_gymnasium as mo_gym
 
 from agents.multi_policy.mo_sac import MOSAC
 from misc.utils import read_env_config, read_algo_config
+
+
+def _kwargs_suffix(kwargs: dict) -> str:
+    """Kompaktes, dateinamen-sicheres Suffix aus den Heuristik-Argumenten.
+
+    Ohne Suffix wuerden Laeufe desselben (env, k, seed, Heuristik) mit
+    unterschiedlichen Konstanten dieselbe history-/fronts-Datei
+    ueberschreiben. Erlaubt sind nur [A-Za-z0-9._-]; das Trennzeichen '@'
+    kollidiert nicht mit dem Signal-Trenner ':'.
+    """
+    if not kwargs:
+        return ''
+    import re
+    parts = []
+    for key in sorted(kwargs):
+        val = kwargs[key]
+        text = f'{val:g}' if isinstance(val, (int, float)) and not isinstance(val, bool) else str(val)
+        # Nicht erlaubte Zeichen ERSETZEN statt loeschen: bei Listenwerten
+        # (z. B. shares='0.5,0.2') wuerden geloeschte Kommas verschiedene
+        # Vektoren auf dasselbe Label abbilden. Key und Wert werden getrennt,
+        # sonst liest sich 'orde'+'random' als 'orderandom'.
+        text = re.sub(r'[^A-Za-z0-9._-]+', '-', text).strip('-')
+        parts.append(f'{key[:4]}-{text}')
+    return '@' + '_'.join(parts)
 
 
 def main():
@@ -51,6 +78,12 @@ def main():
                              'proportional-share, cmu-rule. '
                              f'Signal keys: {", ".join(SELECTABLE_SIGNAL_KEYS)}.')
 
+    parser.add_argument('--heuristic_kwargs', type=str, default='',
+                        help='JSON-Dict mit Konstruktor-Argumenten der Heuristik, z. B. '
+                             '\'{"exploration_constant": 5.45e-4}\' oder \'{"order": "block"}\'. '
+                             'Die Werte landen im Heuristik-Label (und damit in Dateinamen '
+                             'und der history-Spalte), damit Varianten unterscheidbar bleiben.')
+
     args = parser.parse_args()
 
     heuristic_map = {
@@ -64,11 +97,17 @@ def main():
         'marginal-value': (MarginalValueHeuristic, {}),
         'proportional-share': (ProportionalShareHeuristic, {}),
         'cmu-rule': (CMuRuleHeuristic, {}),
+        # Nebenexperimente (2026-08-14, docs/nebenexperimente.md) - NICHT
+        # Teil der 18er-Hauptmatrix, getrennt zu berichten.
+        'successive-halving': (SuccessiveHalvingHeuristic, {}),
+        'fixed-order': (FixedOrderHeuristic, {}),
+        'fixed-share': (FixedShareHeuristic, {}),
     }
     # Heuristics whose identity IS their signal — no ":<signal_key>" variant.
     # cmu-rule laeuft fix mit c=dominance_ranks, mu=prob_improvements
     # (einzige Multi-Signal-Heuristik, Review 2026-07-11).
-    fixed_signal = ('round-robin', 'random', 'mlfq', 'cmu-rule')
+    fixed_signal = ('round-robin', 'random', 'mlfq', 'cmu-rule',
+                    'successive-halving', 'fixed-order', 'fixed-share')
 
     h_name, _, h_signal = args.heuristic.partition(':')
     if h_name not in heuristic_map:
@@ -78,10 +117,30 @@ def main():
         if h_name in fixed_signal:
             parser.error(f"Heuristic '{h_name}' does not support a signal variant.")
         h_kwargs = {**h_kwargs, 'signal_key': h_signal}
-    heuristic_obj = h_cls(**h_kwargs)
+    # Freie Konstruktor-Argumente (Konstanten-Sweeps, Nebenexperimente).
+    extra_kwargs = {}
+    if args.heuristic_kwargs:
+        import json as _json
+        try:
+            extra_kwargs = _json.loads(args.heuristic_kwargs)
+        except ValueError as exc:
+            parser.error(f'--heuristic_kwargs ist kein gueltiges JSON: {exc}')
+        if not isinstance(extra_kwargs, dict):
+            parser.error('--heuristic_kwargs muss ein JSON-Objekt sein.')
+        h_kwargs = {**h_kwargs, **extra_kwargs}
+
+    try:
+        heuristic_obj = h_cls(**h_kwargs)
+    except TypeError as exc:
+        parser.error(f"Heuristik '{h_name}' akzeptiert diese Argumente nicht: {exc}")
     # Label lands in the history.csv 'heuristic' column so signal variants
     # stay distinguishable in the analysis (read by the orchestrator).
-    heuristic_obj.label = h_cls.__name__.replace('Heuristic', '') + (f':{h_signal}' if h_signal else '')
+    heuristic_obj.label = (h_cls.__name__.replace('Heuristic', '')
+                           + (f':{h_signal}' if h_signal else '')
+                           + _kwargs_suffix(extra_kwargs))
+    # Successive Halving braucht das Gesamtbudget fuer seinen Rung-Plan;
+    # ohne diese Angabe faellt es auf reines Round-Robin zurueck.
+    heuristic_obj.total_budget = args.total_timesteps
     base_dir = os.path.dirname(os.path.abspath(__file__))
     env_config = read_env_config(os.path.join(base_dir, 'configs', 'environment_configs.json'))
     env_id = env_config[args.env]['env_id']
