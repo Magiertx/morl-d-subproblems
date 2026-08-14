@@ -58,7 +58,10 @@ def _kwargs_suffix(kwargs: dict) -> str:
                 return ('m' + t[1:]) if t.startswith('-') else t
             text = ','.join(_one(v) for v in val)
         else:
+            # Symmetrie zu _one(): auch ein String mit fuehrendem Minus darf
+            # nicht auf dieselbe Form wie sein positives Gegenstueck fallen.
             text = str(val)
+            text = ('m' + text[1:]) if text.startswith('-') else text
         # Nicht erlaubte Zeichen ERSETZEN statt loeschen: bei Listenwerten
         # (z. B. shares='0.5,0.2') wuerden geloeschte Kommas verschiedene
         # Vektoren auf dasselbe Label abbilden. Key und Wert werden getrennt,
