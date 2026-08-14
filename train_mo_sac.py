@@ -45,9 +45,18 @@ def _kwargs_suffix(kwargs: dict) -> str:
         if isinstance(val, (int, float)) and not isinstance(val, bool):
             # '+' des Exponenten zu 'p': sonst bilden 1e+06 und 1e-06 nach der
             # Zeichenbereinigung dasselbe Suffix und damit denselben Dateinamen.
+            # Vorzeichen explizit kodieren: '.strip("-")' unten wuerde ein
+            # fuehrendes Minus entfernen, -0.05 und 0.05 ergaeben dasselbe
+            # Label und damit denselben Dateinamen (Review 2026-08-14).
             text = f'{val:g}'.replace('+', 'p')
+            text = ('m' + text[1:]) if text.startswith('-') else text
         elif isinstance(val, (list, tuple)):
-            text = ','.join(str(v) for v in val)
+            # Listenelemente durch denselben Pfad schicken, sonst fehlt
+            # ihnen die Vorzeichen-/Exponentenbehandlung.
+            def _one(v):
+                t = f'{v:g}'.replace('+', 'p') if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
+                return ('m' + t[1:]) if t.startswith('-') else t
+            text = ','.join(_one(v) for v in val)
         else:
             text = str(val)
         # Nicht erlaubte Zeichen ERSETZEN statt loeschen: bei Listenwerten
