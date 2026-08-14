@@ -45,7 +45,14 @@ def _kwargs_suffix(kwargs: dict) -> str:
     parts = []
     for key in sorted(kwargs):
         val = kwargs[key]
-        text = f'{val:g}' if isinstance(val, (int, float)) and not isinstance(val, bool) else str(val)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            # '+' des Exponenten zu 'p': sonst bilden 1e+06 und 1e-06 nach der
+            # Zeichenbereinigung dasselbe Suffix und damit denselben Dateinamen.
+            text = f'{val:g}'.replace('+', 'p')
+        elif isinstance(val, (list, tuple)):
+            text = ','.join(str(v) for v in val)
+        else:
+            text = str(val)
         # Nicht erlaubte Zeichen ERSETZEN statt loeschen: bei Listenwerten
         # (z. B. shares='0.5,0.2') wuerden geloeschte Kommas verschiedene
         # Vektoren auf dasselbe Label abbilden. Key und Wert werden getrennt,
@@ -138,16 +145,22 @@ def main():
 
     try:
         heuristic_obj = h_cls(**h_kwargs)
-    except TypeError as exc:
-        parser.error(f"Heuristik '{h_name}' akzeptiert diese Argumente nicht: {exc}")
+    except (TypeError, ValueError) as exc:
+        # Frueh und sauber scheitern: sonst stirbt der Lauf erst auf dem
+        # zugeteilten Rechenknoten mit einem Traceback.
+        parser.error(f"Heuristik '{h_name}' mit diesen Argumenten nicht "
+                     f"konstruierbar: {exc}")
     # Label lands in the history.csv 'heuristic' column so signal variants
     # stay distinguishable in the analysis (read by the orchestrator).
     heuristic_obj.label = (h_cls.__name__.replace('Heuristic', '')
                            + (f':{h_signal}' if h_signal else '')
                            + _kwargs_suffix(extra_kwargs))
-    # Successive Halving braucht das Gesamtbudget fuer seinen Rung-Plan;
-    # ohne diese Angabe faellt es auf reines Round-Robin zurueck.
-    heuristic_obj.total_budget = args.total_timesteps
+    # Successive Halving braucht das Gesamtbudget fuer seinen Rung-Plan; ohne
+    # diese Angabe faellt es auf reines Round-Robin zurueck. Ein explizit per
+    # --heuristic_kwargs gesetzter Wert hat Vorrang, sonst wuerde das Label
+    # einen Wert ausweisen, der nie gewirkt hat.
+    if 'total_budget' not in extra_kwargs:
+        heuristic_obj.total_budget = args.total_timesteps
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     env_config = read_env_config(os.path.join(base_dir, 'configs', 'environment_configs.json'))
