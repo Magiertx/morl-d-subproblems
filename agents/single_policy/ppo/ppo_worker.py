@@ -23,7 +23,7 @@ def evaluation(
 
     Returns the mean discounted objective vector and the per-episode
     objective vectors (shape `(eval_num, reward_dim)`); the latter feed
-    the probability-of-improvement signal (TODO G2).
+    the probability-of-improvement signal.
     """
     env = mo_gym.make(env_id, max_episode_steps=max_episode_steps)
     actor_critic = sample.actor_critic

@@ -18,10 +18,10 @@ from misc.evaluation import log_metrics, evaluate_single_weight
 from agents.single_policy.sac_continues_action import SACContinues
 from misc.weights import generate_das_dennis_weights, generate_layer_energy_weights, generate_dirichlet_weights
 
-# Thesis signal extensions (G1-G3) live in the root repo (/heuristics/signals.py)
+# The progress signals of the thesis live in the root repo (heuristics/signals.py)
 # and are only importable when training is launched through the entry scripts
-# (train_mo_sac.py adds the root to sys.path). Keep the framework usable
-# standalone by degrading gracefully to the base signal set.
+# (train_mo_sac.py adds the root to sys.path). Without them the framework still
+# runs standalone without a heuristic; dynamic heuristics then raise an error.
 try:
     from heuristics.signals import (probability_of_improvement,
                                     dominance_rank, improvement_per_step)
@@ -33,11 +33,11 @@ except ImportError:
 def _locked_history_append(history_file: str, header: str, rows: list) -> None:
     """Append rows to a per-heuristic history CSV under an exclusive lock file.
 
-    Seit 2026-07-11 schreibt jede Heuristik ihre eigene history_<Label>.csv;
-    der Lock schuetzt nur noch gegen doppelte Schreiber desselben Laufs
-    (SLURM-Requeue), nicht mehr gegen andere Heuristiken. Der Header-Check und
-    der Append bleiben serialisiert (otherwise: duplicated headers mid-file /
-    interleaved partial rows — review 2026-07-03).
+    Jede Heuristik schreibt ihre eigene history_<Label>.csv, andere
+    Heuristiken schreiben also nie in dieselbe Datei. Der Lock schuetzt gegen
+    doppelte Schreiber desselben Laufs (SLURM-Requeue). Header-Check und
+    Append sind serialisiert (otherwise: duplicated headers mid-file /
+    interleaved partial rows).
     Lock: O_CREAT|O_EXCL lock file (portable across Windows, Linux and NFS);
     stale locks older than 60s are stolen, after 120s we write unlocked as a
     last resort (losing lock safety beats losing the run's results).
@@ -361,19 +361,19 @@ class MOSAC(Agent):
         import os
         h_name = getattr(self, 'heuristic_name', 'RoundRobin')
         if not hasattr(self, '_eval_returns_histories'):
-            # Per-agent signal histories keyed by agent.id (G2/G3).
+            # Per-agent signal histories (eval-episode returns, dominance ranks), keyed by position.
             self._eval_returns_histories = {}
             self._dominance_histories = {}
         history_rows = []
         # Per-Position gesammelte Roh-Felder; die fertige Zeile wird erst NACH
         # dem Dominanz-Append gebaut, damit dominance_rank den frischen
-        # Checkpoint traegt (Review 2026-07-11) statt einen Schritt alt zu sein.
+        # Checkpoint traegt statt einen Schritt alt zu sein.
         row_fields = {}
         agent_disc_returns = {}
         # Discounted scalarized return per position — returned to the caller so
         # the heuristic bookkeeping (scalar_history) uses the SAME seeded
         # eval_rep-episode evaluation that feeds history.csv and the archive
-        # (review 2026-07-03; previously a separate unseeded 3-episode eval).
+        # (no separate evaluation run for the heuristic).
         agent_scalars = {}
         # NOTE: agent.id is seed-based (seed + position, see _create_new_agent);
         # task bookkeeping (active_tasks, timesteps_trained, history.csv) is
@@ -382,10 +382,10 @@ class MOSAC(Agent):
             scalarized_return, scalarized_discounted_return, vec_return, disc_vec_return, episode_evals = (
                 evaluate_single_weight(agent, env=eval_env, w=agent.weights.cpu().numpy(), rep=eval_rep,
                                        seed=eval_seed, eval_gamma=eval_gamma, return_episodes=True))
-            # Individual eval-episode returns (DISCOUNTED scalarized, e[1]) — G2.
-            # Discounted to match PPO's logging semantics (review 2026-07-03:
-            # PPO logs discounted returns; mixing conventions across algos
-            # would break the pooled analysis of scalar/r_*/eval_scalars).
+            # Individual eval-episode returns (DISCOUNTED scalarized, e[1]) —
+            # input for probability_of_improvement. Discounted to match PPO's
+            # logging semantics (PPO logs discounted returns; mixing conventions
+            # across algos would break the pooled analysis of scalar/r_*/eval_scalars).
             episode_scalars = [float(e[1]) for e in episode_evals]
             agent_scalars[pos] = float(scalarized_discounted_return)
             self._eval_returns_histories.setdefault(pos, []).append(episode_scalars)
@@ -425,13 +425,13 @@ class MOSAC(Agent):
                 f"{scalarized_discounted_return},{r_time},{r_ener_f},{r_ener_b},"
                 f"{t_trained},{elapsed:.2f},{eval_scalars}", params)
 
-        # Dominance rank of every agent vs. the fully updated archive (G3).
+        # Dominance rank of every agent vs. the fully updated archive.
         if _EXT_SIGNALS:
             for pos in range(len(agents)):
                 self._dominance_histories.setdefault(pos, []).append(
                     dominance_rank(agent_disc_returns[pos], self.archive.evaluations))
 
-        # Zeilen erst jetzt bauen: dominance_rank aus dem soeben aktualisierten
+        # Zeilen erst hier bauen: dominance_rank aus dem soeben aktualisierten
         # _dominance_histories, damit die Provenienz-Spalte zum Checkpoint passt.
         for pos in range(len(agents)):
             head, params = row_fields[pos]
@@ -452,9 +452,9 @@ class MOSAC(Agent):
             elapsed = time_mod.perf_counter() - self.start_time if hasattr(self, 'start_time') else 0.0
             writer.add_scalar('eval/training_time', elapsed, self.global_step)
 
-        # HV + Front-Speicherung VOR dem return (Review Betreuerin 2026-07-11,
-        # Punkt 1a: der Block stand hinter dem return und war toter Code —
-        # SAC loggte kein Hypervolume und speicherte keine Fronten).
+        # Hypervolumen des Archivs loggen und die Front speichern (bei
+        # save_front); danach gehen die diskontierten Skalar-Returns je
+        # Position an train() zurueck.
         front = self.archive.evaluations
         hv = log_metrics(front, ref_point=ref_point, known_pareto_front=known_pareto_front,
                          reward_dim=self.reward_dim, num_sample_weights=num_sample_weights,
@@ -544,7 +544,7 @@ class MOSAC(Agent):
     def _compute_signals(self, active_tasks: list) -> dict:
         """Performance signals consumed by dynamic budget-allocation heuristics.
 
-        Bereinigtes Set (Review 2026-07-11): prob_improvements (Rate),
+        Auswaehlbare Signale: prob_improvements (Rate),
         dominance_ranks (Position, normierter Anteil), improvement_per_step
         (Roh-Kontrolle). scalar_histories + spent_budget sind interne
         Zutaten (MLFQ-Demotion, Early-Stopping, Boost-Takt).
@@ -690,8 +690,8 @@ class MOSAC(Agent):
 
         # Seed scalar_history from the SAME seeded, eval_rep-episode, discounted
         # evaluation that feeds history.csv and the archive — single source of
-        # truth like in PPO (review 2026-07-03). PPO selbst hat KEINE Initial-
-        # Evaluation und startet leer (Review 2026-07-11 Punkt 1b).
+        # truth like in PPO. PPO selbst evaluiert bei Schritt 0 KEINE Policies
+        # und startet mit leerer scalar_history.
         for t in active_tasks:
             t['scalar_history'].append(init_scalars[t['id']])
             t['timesteps_history'].append(0)
@@ -711,8 +711,8 @@ class MOSAC(Agent):
                 # heuristic (positional indexing) — full-k arrays shift every
                 # index once a task was eliminated (IndexError / wrong task).
                 signals = self._compute_signals(active_list)
-                # Never let a single deactivation sweep empty the pool
-                # (review 2026-07-03).
+                # Never let a single deactivation sweep empty the pool:
+                # at least one task always stays active.
                 remaining = len(active_list)
                 for i, t in enumerate(active_list):
                     if remaining <= 1:

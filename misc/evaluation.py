@@ -54,7 +54,7 @@ def evaluate_single_weight(agent: Agent, env: gym.Env, w: np.ndarray, scalarizat
     avg_disc_vec_return = np.mean([eval[3] for eval in evals], axis=0)
     if return_episodes:
         # Per-episode tuples (scalarized, scalarized_discounted, vec, disc_vec) —
-        # needed for the probability-of-improvement signal (TODO G2).
+        # needed for the probability-of-improvement signal.
         return avg_scalarized_return, avg_scalarized_discounted_return, avg_vec_return, avg_disc_vec_return, evals
     return avg_scalarized_return, avg_scalarized_discounted_return, avg_vec_return, avg_disc_vec_return
 

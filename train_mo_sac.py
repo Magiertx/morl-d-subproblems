@@ -47,7 +47,7 @@ def _kwargs_suffix(kwargs: dict) -> str:
             # Zeichenbereinigung dasselbe Suffix und damit denselben Dateinamen.
             # Vorzeichen explizit kodieren: '.strip("-")' unten wuerde ein
             # fuehrendes Minus entfernen, -0.05 und 0.05 ergaeben dasselbe
-            # Label und damit denselben Dateinamen (Review 2026-08-14).
+            # Label und damit denselben Dateinamen.
             text = f'{val:g}'.replace('+', 'p')
             text = ('m' + text[1:]) if text.startswith('-') else text
         elif isinstance(val, (list, tuple)):
@@ -88,10 +88,10 @@ def main():
                         help='Initial weight sampling strategy.')
     parser.add_argument('--eval_timesteps', type=int, default=10_000,
                         help='Chunk size in env steps between heuristic decisions / evaluations '
-                             '(SAC is step-based, any value works; supervisor target range 1k-5k).')
+                             '(SAC is step-based, any value works; 4096 matches one MO-PPO rollout).')
     parser.add_argument('--heuristic', type=str, default='round-robin',
                         help='Budget allocation heuristic, optionally with a signal variant '
-                             '"<name>:<signal_key>" (B2), e.g. "bandit:prob_improvements". '
+                             '"<name>:<signal_key>", e.g. "bandit:prob_improvements". '
                              'Names: round-robin, random, rank-based, bandit, rotting-bandit, '
                              'rr-early-stopping, mlfq, marginal-value, '
                              'proportional-share, cmu-rule. '
@@ -116,15 +116,15 @@ def main():
         'marginal-value': (MarginalValueHeuristic, {}),
         'proportional-share': (ProportionalShareHeuristic, {}),
         'cmu-rule': (CMuRuleHeuristic, {}),
-        # Nebenexperimente (2026-08-14, docs/nebenexperimente.md) - NICHT
-        # Teil der 18er-Hauptmatrix, getrennt zu berichten.
+        # Heuristiken der Nebenexperimente - NICHT Teil der 18
+        # Konfigurationen der Hauptmatrix, werden getrennt ausgewertet.
         'successive-halving': (SuccessiveHalvingHeuristic, {}),
         'fixed-order': (FixedOrderHeuristic, {}),
         'fixed-share': (FixedShareHeuristic, {}),
     }
     # Heuristics whose identity IS their signal — no ":<signal_key>" variant.
-    # cmu-rule laeuft fix mit c=dominance_ranks, mu=prob_improvements
-    # (einzige Multi-Signal-Heuristik, Review 2026-07-11).
+    # cmu-rule laeuft fest mit c=dominance_ranks, mu=prob_improvements
+    # (einzige Multi-Signal-Heuristik).
     fixed_signal = ('round-robin', 'random', 'mlfq', 'cmu-rule',
                     'successive-halving', 'fixed-order', 'fixed-share')
 

@@ -25,10 +25,10 @@ from agents.single_policy.ppo.a2c_ppo.model import Policy
 from agents.single_policy.ppo.a2c_ppo.envs import make_vec_envs
 from agents.single_policy.ppo.external_pareto import ExternalPareto
 
-# Thesis signal extensions (G1-G3) live in the root repo (/heuristics/signals.py)
+# The progress signals of the thesis live in the root repo (heuristics/signals.py)
 # and are only importable when training is launched through the entry scripts
-# (train_mo_ppo.py adds the root to sys.path). Keep the framework usable
-# standalone by degrading gracefully to the base signal set.
+# (train_mo_ppo.py adds the root to sys.path). Without them the framework still
+# runs standalone without a heuristic; dynamic heuristics then raise an error.
 try:
     from heuristics.signals import (probability_of_improvement,
                                     dominance_rank, improvement_per_step)
@@ -48,11 +48,11 @@ def _available_cpus():
 def _locked_history_append(history_file: str, header: str, rows: list) -> None:
     """Append rows to a per-heuristic history CSV under an exclusive lock file.
 
-    Seit 2026-07-11 schreibt jede Heuristik ihre eigene history_<Label>.csv;
-    der Lock schuetzt nur noch gegen doppelte Schreiber desselben Laufs
-    (SLURM-Requeue), nicht mehr gegen andere Heuristiken. Der Header-Check und
-    der Append bleiben serialisiert (otherwise: duplicated headers mid-file /
-    interleaved partial rows — review 2026-07-03).
+    Jede Heuristik schreibt ihre eigene history_<Label>.csv, andere
+    Heuristiken schreiben also nie in dieselbe Datei. Der Lock schuetzt gegen
+    doppelte Schreiber desselben Laufs (SLURM-Requeue). Header-Check und
+    Append sind serialisiert (otherwise: duplicated headers mid-file /
+    interleaved partial rows).
     Lock: O_CREAT|O_EXCL lock file (portable across Windows, Linux and NFS);
     stale locks older than 60s are stolen, after 120s we write unlocked as a
     last resort (losing lock safety beats losing the run's results).
@@ -378,7 +378,7 @@ class MOPPO(Agent):
     def _compute_signals(self, active_tasks: list) -> dict:
         """Performance signals consumed by dynamic budget-allocation heuristics.
 
-        Bereinigtes Set (Review 2026-07-11): prob_improvements (Rate),
+        Auswaehlbare Signale: prob_improvements (Rate),
         dominance_ranks (Position, normierter Anteil), improvement_per_step
         (Roh-Kontrolle). scalar_histories + spent_budget sind interne
         Zutaten (MLFQ-Demotion, Early-Stopping, Boost-Takt).
@@ -458,11 +458,11 @@ class MOPPO(Agent):
         all_samples = list(self.initial_samples)
 
         # Per-subproblem state used by the heuristic. Indexed by sample_id.
-        # scalar_history startet LEER (Review 2026-07-11 Punkt 1b): der alte
-        # -1000.0-Platzhalter machte die erste echte Rate zu einem +1000-Artefakt
-        # und vergiftete jedes darauf aufbauende Signal. SAC seedet mit dem
-        # echten Initial-Skalar (hat eine Initial-Evaluation); PPO hat keine,
-        # also bleiben Raten undefiniert (=0), bis zwei echte Punkte vorliegen.
+        # scalar_history startet LEER: ein Platzhalter wie -1000.0 wuerde die
+        # erste echte Rate zu einem +1000-Artefakt machen und jedes darauf
+        # aufbauende Signal verfaelschen. SAC seedet mit dem echten Initial-
+        # Skalar (hat eine Initial-Evaluation); PPO evaluiert bei Schritt 0 keine
+        # Policies, also bleiben Raten undefiniert (=0), bis zwei echte Punkte vorliegen.
         active_tasks = [
             {'id': idx, 'scalar_history': [], 'active': True, 'timesteps_trained': 0,
              'timesteps_history': [], 'eval_returns_history': [], 'dominance_history': []}
@@ -478,10 +478,10 @@ class MOPPO(Agent):
             if not pf_store:
                 return
             h_name = getattr(heuristic, 'label', None) or (heuristic.__class__.__name__.replace("Heuristic", "") if heuristic else "RoundRobin")
-            # Eine history-Datei PRO HEURISTIK (Review 2026-07-11): parallele
-            # Laeufe desselben (env, algo, k, seed) schreiben nie mehr in
-            # dieselbe Datei — die NFS-Race-Frage entfaellt, der Merge passiert
-            # beim Auswerten. Lock bleibt als Schutz gegen SLURM-Requeues.
+            # Eine history-Datei PRO HEURISTIK: parallele Laeufe desselben
+            # (env, algo, k, seed) schreiben nie in dieselbe Datei, es gibt also
+            # keine NFS-Races; zusammengefuehrt wird beim Auswerten. Der Lock
+            # schuetzt gegen doppelte Schreiber bei SLURM-Requeues.
             history_file = os.path.join(os.path.dirname(os.path.dirname(pf_store.path)),
                                         f"history_{h_name.replace(':', '-')}.csv")
             # Run parameters mirrored into every row so runs with different
@@ -512,7 +512,7 @@ class MOPPO(Agent):
                     r_ener_b = objs[2]
 
                 scalar = float(np.dot(objs, sample.weights.cpu().numpy())) if hasattr(sample, 'weights') and sample.weights is not None else -200.0
-                # Latest individual eval-episode returns (';'-joined, CSV-safe) — G2 logging.
+                # Latest individual eval-episode returns (';'-joined, CSV-safe).
                 eval_scalars = ";".join(f"{v:.4f}" for v in task['eval_returns_history'][-1]) if task.get('eval_returns_history') else ""
                 dom_rank = task['dominance_history'][-1] if task.get('dominance_history') else 0.0
                 rows.append(f"{self.seed},{h_name},ON,{spent_budget},{i},{scalar},{r_time},{r_ener_f},{r_ener_b},{task.get('timesteps_trained', 0)},{elapsed:.2f},{eval_scalars},{dom_rank},{run_params}\n")
@@ -543,7 +543,7 @@ class MOPPO(Agent):
                     # Never let a single deactivation sweep empty the pool: the
                     # in-heuristic "last task" guards check the round-START
                     # length, so simultaneous eliminations could kill every
-                    # task and silently end the run early (review 2026-07-03).
+                    # task and silently end the run early.
                     remaining = len(active_list)
                     for i, t in enumerate(active_list):
                         if remaining <= 1:
@@ -620,7 +620,7 @@ class MOPPO(Agent):
                     task['timesteps_history'].append(task['timesteps_trained'])
 
                     # Individual eval-episode returns, scalarized on the task
-                    # weight — feeds probability of improvement (G2).
+                    # weight — feeds probability of improvement.
                     if r.get('eval_episode_objs') is not None:
                         w_np = latest.weights.cpu().numpy() if hasattr(latest.weights, 'cpu') else np.asarray(latest.weights)
                         episode_scalars = [float(np.dot(ep, w_np)) for ep in r['eval_episode_objs']]
@@ -630,7 +630,7 @@ class MOPPO(Agent):
                 for sample in all_sample_batch:
                     self.ep.update([sample])
 
-                # Dominance rank of each trained task vs. the updated archive (G3).
+                # Dominance rank of each trained task vs. the updated archive.
                 if _EXT_SIGNALS:
                     for r in results:
                         task = active_tasks[r['task_id']]
